@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "ThermalControl",
+    "slug": "thermalcontrol-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "thermalcontrol",
+    "splash": {
+      "backgroundColor": "#07090e"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.thermalcontrol.mobile"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#07090e"
+      },
+      "package": "com.thermalcontrol.mobile"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store"
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+# Secrets
+Backend/.env
+.env
+
+# Runtime artifacts
+**/__pycache__/
+*.pyc
+**/*.log
+Backend/logs/
+
+# Virtual environments
+.venv/
+venv/
+
+# LibreHardwareMonitor runtime config (mutated on every run)
+Backend/lib/LibreHardwareMonitor.config
