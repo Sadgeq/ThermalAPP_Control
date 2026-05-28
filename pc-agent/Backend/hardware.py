@@ -115,12 +115,115 @@ class HardwareMonitor:
         # lazily on first set_fan_mode call to avoid loading the wmi
         # package on non-Lenovo machines.
         self._wmi_fan = None
+        # One-time guard so the "fell back to WMI for fan reads" log line
+        # in read_fan_speeds doesn't spam every monitoring tick.
+        self._wmi_fans_logged = False
+        # Same one-shot for "no LHM PWM controllers" — set_fan_speed is
+        # called every tick by the monitoring loop, we don't want a
+        # warning per call on hardware that lacks per-fan PWM.
+        self._pwm_unavailable_logged = False
+
+        # Vendor / model fingerprint, queried once at boot. Used to
+        # advertise the chosen controller and to gate vendor-specific
+        # paths (e.g. Legion fan-mode WMI).
+        self.vendor, self.model = self._detect_system()
 
         if self._lhm_available:
             self._init_lhm()
+            # On Lenovo Legion, LHM almost never enumerates fans as
+            # SensorType.Fan (the EC doesn't expose them that way), so
+            # fan_count stays 0 even though the WMI namespace
+            # LENOVO_GAMEZONE_DATA can both read RPM and set fan mode.
+            # Reflect WMI's view in fan_count so downstream code (the
+            # agent's monitoring loop, PID dispatch, /api/status) treats
+            # the machine as having fans. Without this the PID controller
+            # is gated off behind `if fan_count > 0` and silently
+            # contributes nothing.
+            if self.fan_count == 0 and self.vendor.lower().startswith("lenovo"):
+                try:
+                    wmi_ctrl = self._ensure_wmi_fan()
+                    if wmi_ctrl is not None:
+                        wmi_count = wmi_ctrl.read_fan_count() or 2
+                        wmi_count = max(1, min(int(wmi_count), 4))
+                        self.fan_count = wmi_count
+                        logger.info(
+                            f"fan_count set to {wmi_count} via Legion WMI "
+                            f"(LHM saw 0 fans)"
+                        )
+                except Exception as e:
+                    logger.debug(f"WMI fan_count probe failed: {e}")
         else:
             self.fan_count = 2
             logger.info("Running in DEMO mode")
+
+    @staticmethod
+    def _detect_system() -> tuple[str, str]:
+        """Read manufacturer + model from Win32_ComputerSystem once at boot.
+
+        Cheap, blocking ~50ms PowerShell call. We do it once so vendor
+        detection is available without a WMI roundtrip per check. Returns
+        ('', '') on non-Windows or if the query fails — callers handle
+        absence as 'unknown vendor'.
+        """
+        if sys.platform != "win32":
+            return ("", "")
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "$cs = Get-CimInstance Win32_ComputerSystem; "
+                 "Write-Output \"$($cs.Manufacturer)|$($cs.Model)\""],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                line = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+                if "|" in line:
+                    vendor, model = line.split("|", 1)
+                    return (vendor.strip()[:64], model.strip()[:128])
+        except Exception as e:
+            logger.debug(f"Vendor detection failed: {e}")
+        return ("", "")
+
+    @property
+    def controller_name(self) -> str:
+        """Human-readable identifier for the fan-control path in use.
+
+        Stable string clients can show in 'Driver: <name>' fields and that
+        we can grep for in support tickets. Doesn't depend on _wmi_fan being
+        initialized — the lazy load happens on first set_fan_mode.
+        """
+        if not self._lhm_available:
+            return "demo"
+        if self.vendor.lower().startswith("lenovo"):
+            return "lenovo-legion-wmi"
+        if self._fan_controllers:
+            return "lhm-pwm"
+        return "sensors-only"
+
+    @property
+    def has_pwm_control(self) -> bool:
+        """True if the hardware exposes per-fan continuous PWM control.
+
+        On Lenovo Legion (and most consumer laptops) the EC only accepts a
+        coarse 3-state FanMode (Quiet/Balanced/Performance) through WMI,
+        not a continuous duty-cycle. set_fan_speed() then becomes a no-op,
+        and PID output has to be quantized to FanMode in agent.py.
+        """
+        return bool(self._fan_controllers)
+
+    @property
+    def capabilities(self) -> dict:
+        """What this hardware actually lets us do.
+
+        Surfaced via /api/status so the UI can show 'Sensor monitoring only'
+        instead of dead fan-control buttons on unsupported hardware.
+        """
+        return {
+            "sensors":  bool(self._lhm_available) or True,  # demo also reads sensors
+            "fan_speed": bool(self._fan_controllers),
+            "fan_mode":  self.vendor.lower().startswith("lenovo") and self._lhm_available,
+            "demo":     not self._lhm_available,
+        }
 
     def _init_lhm(self):
         from LibreHardwareMonitor.Hardware import Computer
@@ -130,7 +233,17 @@ class HardwareMonitor:
         self._computer.IsMotherboardEnabled = True
         self._computer.IsMemoryEnabled = True
         self._computer.IsControllerEnabled = True
-        self._computer.IsStorageEnabled = True
+        # Storage enumeration is intentionally OFF.
+        # LHM's Storage.UpdateSpaceSensors() crashes with
+        # IndexOutOfRangeException on some Windows volume layouts
+        # (e.g., recovery partitions without a drive letter, BitLocker-
+        # locked volumes, or virtual drives created by some VPN/security
+        # tools). The exception bubbles up out of `hw.Update()` inside
+        # _lhm_read, which then falls back to demo data — the symptom is
+        # cpu_temp permanently reading 38°C and the PID controller never
+        # actually regulating anything. We don't surface storage temps in
+        # the UI anyway, so disabling the whole Storage tree is safe.
+        self._computer.IsStorageEnabled = False
         self._computer.Open()
         self._discover_hardware()
         # Log all detected sensors for diagnostics
@@ -198,22 +311,82 @@ class HardwareMonitor:
             return self._demo_data()
 
     def read_fan_speeds(self):
+        """Return [{name, rpm, percent}] for every fan we can read.
+
+        Fan reading on Lenovo Legion (and probably other Legion EC variants)
+        is unreliable through LibreHardwareMonitor — see wmi_fan.py header.
+        Two failure modes happen in the wild:
+
+          * LHM detects fan sensors but their .Value reads come back 0 or
+            None because the EC registers LHM polls don't expose live RPM.
+          * LHM doesn't detect fans at all because the EC doesn't surface
+            them with SensorType.Fan; they only show up via Lenovo's WMI
+            namespace (LENOVO_GAMEZONE_DATA.GetFan1Speed / GetFan2Speed).
+
+        We handle both. If LHM detected fans, we try LHM first and fall
+        back to WMI per-fan when LHM reports 0. If LHM detected no fans,
+        we synthesize the list directly from WMI.
+        """
         if not self._lhm_available:
             return self._demo_fans()
         try:
             for hw in self._computer.Hardware:
-                hw.Update()
-                for sub in hw.SubHardware:
-                    sub.Update()
-            result = []
-            for i, fan in enumerate(self._fans):
-                rpm = int(fan.Value) if fan.Value is not None else 0
-                pct = None
-                if i < len(self._fan_controllers):
-                    v = self._fan_controllers[i].Value
-                    pct = float(v) if v is not None else None
-                result.append({"name": str(fan.Name), "rpm": rpm, "percent": pct})
-            return result
+                # Same per-hardware isolation as _lhm_read — Storage and
+                # other flaky components shouldn't take down fan reads.
+                try:
+                    hw.Update()
+                    for sub in hw.SubHardware:
+                        try:
+                            sub.Update()
+                        except Exception as e:
+                            logger.debug(f"LHM SubHardware {sub.Name} Update failed: {e}")
+                except Exception as e:
+                    logger.debug(f"LHM Hardware {hw.Name} Update failed: {e}")
+                    continue
+
+            wmi_ctrl = self._ensure_wmi_fan()
+            result: list[dict] = []
+
+            if self._fans:
+                # LHM saw fans. Use them as the primary source; fall back
+                # to WMI for RPM where LHM reports 0.
+                for i, fan in enumerate(self._fans):
+                    rpm = int(fan.Value) if fan.Value is not None else 0
+                    if rpm == 0 and wmi_ctrl is not None:
+                        wmi_rpm = wmi_ctrl.read_fan_rpm(i)
+                        if wmi_rpm and wmi_rpm > 0:
+                            rpm = wmi_rpm
+                    pct = None
+                    if i < len(self._fan_controllers):
+                        v = self._fan_controllers[i].Value
+                        pct = float(v) if v is not None else None
+                    result.append({"name": str(fan.Name), "rpm": rpm, "percent": pct})
+                return result
+
+            # LHM saw no fans. On Legion this is common — the EC doesn't
+            # surface fans as SensorType.Fan. Build the list entirely from
+            # WMI. Without a PWM controller value, compute percent as
+            # rpm / max_rpm so the UI's "% of max" indicator means
+            # something instead of always reading 0%.
+            if wmi_ctrl is not None:
+                count = wmi_ctrl.read_fan_count() or 2     # Legion has 2; safe default
+                count = max(1, min(int(count), 4))         # bound it
+                max_rpm = wmi_ctrl.read_max_rpm() or 0
+                names = ["CPU Fan", "GPU Fan", "Fan 3", "Fan 4"]
+                for i in range(count):
+                    rpm = wmi_ctrl.read_fan_rpm(i) or 0
+                    pct = (rpm / max_rpm * 100.0) if max_rpm > 0 else None
+                    result.append({"name": names[i], "rpm": rpm, "percent": pct})
+                if not self._wmi_fans_logged:
+                    logger.info(
+                        f"Fan reads via WMI fallback: {count} fan(s), max {max_rpm} rpm "
+                        f"(LHM didn't detect fans on this hardware)"
+                    )
+                    self._wmi_fans_logged = True
+                return result
+
+            # No source of fan data on this hardware — sensors-only mode.
+            return []
         except Exception as e:
             logger.error(f"Failed to read fan speeds: {e}")
             return self._demo_fans()
@@ -235,9 +408,20 @@ class HardwareMonitor:
         storage_temps = []
 
         for hw in self._computer.Hardware:
-            hw.Update()
-            for sub in hw.SubHardware:
-                sub.Update()
+            # Per-hardware try: if one component (e.g. Storage, a flaky GPU)
+            # throws on Update(), we skip just that component instead of
+            # losing all sensor reads for the tick. CPU temp must still
+            # reach the agent for PID/curve to act.
+            try:
+                hw.Update()
+                for sub in hw.SubHardware:
+                    try:
+                        sub.Update()
+                    except Exception as e:
+                        logger.debug(f"LHM SubHardware {sub.Name} Update failed: {e}")
+            except Exception as e:
+                logger.debug(f"LHM Hardware {hw.Name} Update failed: {e}")
+                continue
 
             # --- CPU ---
             if hw.HardwareType == HardwareType.Cpu:
@@ -420,6 +604,18 @@ class HardwareMonitor:
                 self._demo_fan_pct[fan_index] = speed_percent
             return
 
+        if not self._fan_controllers:
+            # No LHM PWM controllers detected — typical on Lenovo Legion,
+            # which only exposes a 3-state FanMode through WMI (handled in
+            # agent.py via the PWM->FanMode quantizer). Silently no-op
+            # here instead of warning every tick. Logged once at startup.
+            if not self._pwm_unavailable_logged:
+                logger.info(
+                    "Per-fan PWM control unavailable on this hardware; "
+                    "PID output will be quantized to FanMode by agent."
+                )
+                self._pwm_unavailable_logged = True
+            return
         if fan_index >= len(self._fan_controllers):
             logger.warning(f"Fan index {fan_index} out of range (max {len(self._fan_controllers) - 1})")
             return
@@ -504,68 +700,82 @@ class HardwareMonitor:
             self._computer = None
             logger.info("Hardware monitor closed")
 
-    @staticmethod
-    def _wmi_cpu_temp():
-        """Fallback: read CPU temp from Windows WMI ACPI thermal zone.
-        Tries multiple methods since availability varies by hardware/BIOS."""
-        if sys.platform != "win32":
+    # Each entry: (label, powershell command, parser function -> celsius or None)
+    _WMI_CPU_TEMP_METHODS = [
+        ("MSAcpi",
+         "Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction Stop | Select -First 1 -ExpandProperty CurrentTemperature",
+         lambda raw: (float(raw) / 10.0) - 273.15),
+        ("OHM",
+         "Get-CimInstance -Namespace root/OpenHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object {$_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*'} | Select -First 1 -ExpandProperty Value",
+         lambda raw: float(raw)),
+        ("LHM",
+         "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object {$_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*'} | Select -First 1 -ExpandProperty Value",
+         lambda raw: float(raw)),
+    ]
+
+    def _wmi_cpu_temp(self):
+        """Fallback: read CPU temp from Windows WMI when LHM doesn't have one.
+
+        Each subprocess call to PowerShell costs 50-500ms when it works and
+        up to the timeout (now 1.5s) when it doesn't. Trying all three
+        methods on every sensor read is what stalled the worker thread for
+        15s in the worst case before this rewrite. We now:
+          1. Cache which method succeeded (`_wmi_cpu_method_idx`) so we
+             only call the working one on subsequent reads.
+          2. Set a `_wmi_cpu_dead` flag if all three fail, so a system
+             with no working WMI temp source doesn't keep retrying.
+          3. Use psutil as a last resort (mostly useful on Linux dev boxes).
+        """
+        # Permanent giveup — set when first probe of all three failed.
+        if getattr(self, "_wmi_cpu_dead", False):
             return None
+
+        if sys.platform != "win32":
+            # Try psutil; useful when running the agent on Linux for dev.
+            try:
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for entries in temps.values():
+                        for entry in entries:
+                            if entry.current and 0 < entry.current < 150:
+                                return round(entry.current, 1)
+            except Exception:
+                pass
+            self._wmi_cpu_dead = True
+            return None
+
         import subprocess
 
-        # Method 1: MSAcpi_ThermalZoneTemperature (requires admin, works on most laptops)
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction Stop | Select -First 1 -ExpandProperty CurrentTemperature"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                raw = float(result.stdout.strip())
-                celsius = (raw / 10.0) - 273.15
-                if 0 < celsius < 150:
-                    return round(celsius, 1)
-            logger.debug(f"WMI MSAcpi method: rc={result.returncode}, stdout='{result.stdout.strip()[:50]}', stderr='{result.stderr.strip()[:80]}'")
-        except Exception as e:
-            logger.debug(f"WMI MSAcpi method failed: {e}")
+        cached_idx = getattr(self, "_wmi_cpu_method_idx", None)
+        # If we've already found a working method, only try that one. If not,
+        # try all of them in order until one works.
+        indices = [cached_idx] if cached_idx is not None else range(len(self._WMI_CPU_TEMP_METHODS))
 
-        # Method 2: OpenHardwareMonitor WMI namespace (if OHM/LHM exposes it)
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance -Namespace root/OpenHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object {$_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*'} | Select -First 1 -ExpandProperty Value"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                celsius = float(result.stdout.strip())
-                if 0 < celsius < 150:
-                    return round(celsius, 1)
-        except Exception as e:
-            logger.debug(f"WMI OHM method failed: {e}")
+        for i in indices:
+            label, cmd, parse = self._WMI_CPU_TEMP_METHODS[i]
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", cmd],
+                    capture_output=True, text=True, timeout=1.5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    celsius = parse(result.stdout.strip())
+                    if 0 < celsius < 150:
+                        if cached_idx is None:
+                            # Lock in the first method that worked. Future
+                            # calls bypass the other two entirely.
+                            self._wmi_cpu_method_idx = i
+                            logger.info(f"WMI CPU temp via {label}: caching this method")
+                        return round(celsius, 1)
+            except Exception as e:
+                logger.debug(f"WMI {label} method failed: {e}")
 
-        # Method 3: LibreHardwareMonitor WMI namespace
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object {$_.SensorType -eq 'Temperature' -and $_.Name -like '*CPU*'} | Select -First 1 -ExpandProperty Value"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                celsius = float(result.stdout.strip())
-                if 0 < celsius < 150:
-                    return round(celsius, 1)
-        except Exception as e:
-            logger.debug(f"WMI LHM method failed: {e}")
-
-        # Last resort: psutil (only works on Linux with sensors)
-        try:
-            temps = psutil.sensors_temperatures()
-            if temps:
-                for name, entries in temps.items():
-                    for entry in entries:
-                        if entry.current and 0 < entry.current < 150:
-                            return round(entry.current, 1)
-        except Exception:
-            pass
+        # First-time exhaustive probe failed → permanent giveup. (If we had
+        # a cached method and it just failed once, that's a transient blip;
+        # we'll retry it next loop without re-probing the others.)
+        if cached_idx is None:
+            self._wmi_cpu_dead = True
+            logger.info("WMI CPU temp: no working source on this system; will not retry")
         return None
 
     def _demo_data(self):

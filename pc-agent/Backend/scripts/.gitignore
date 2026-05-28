@@ -1,0 +1,8 @@
+# Generated experiment outputs — kept out of git so the repo stays small
+# and so test runs from different machines don't collide. The thesis
+# uses copies of the final figures committed to docs/, not these.
+data/*.csv
+data/*.json
+figures/*.png
+figures/*.json
+figures/metrics.csv
