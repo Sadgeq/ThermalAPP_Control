@@ -458,13 +458,24 @@ def _run_experiment(args, hw, fan_index: int):
     # quietly modulates the fan despite our PWM write, the model fits are
     # contaminated. The lock_fan_and_verify check at the start can miss
     # this if BIOS only intervenes under thermal pressure.
+    # IMPORTANT: read RPM from the column for the locked fan, NOT a hard
+    # coded fan0. Many desktops have a CPU_FAN header that LHM enumerates
+    # as fan_index >= 1, while fan_index 0 is an idle slot reporting 0 RPM
+    # — checking that would always trigger a false WARNING.
     active = df[df.phase.isin(["response", "cooldown"])].copy()
-    fan_rpms = active.fan0_rpm.dropna().astype(float).values
+    locked_col = f"fan{fan_index}_rpm"
+    if locked_col not in df.columns:
+        # CSV doesn't include the locked fan's column (only fan0/fan1
+        # logged by default). Fall back to fan0 but warn.
+        locked_col = "fan0_rpm"
+        print(f"\n[fan-check] note: locked fan{fan_index} not in CSV columns; "
+              f"falling back to fan0_rpm")
+    fan_rpms = active[locked_col].dropna().astype(float).values
     if len(fan_rpms) >= 10:
         rpm_mean = float(fan_rpms.mean())
         rpm_std = float(fan_rpms.std())
         rpm_cv = rpm_std / rpm_mean if rpm_mean > 0 else 1.0
-        print(f"\n[fan-check] fan0 RPM during experiment: "
+        print(f"\n[fan-check] {locked_col} during experiment: "
               f"mean={rpm_mean:.0f}, std={rpm_std:.0f}, cv={rpm_cv*100:.1f}%")
         if rpm_cv > 0.10:
             print("[fan-check] WARNING: fan RPM varied >10% during the run.")
