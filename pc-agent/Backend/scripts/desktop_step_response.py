@@ -476,6 +476,56 @@ def _run_experiment(args, hw, fan_index: int):
     else:
         print("[fan-check] insufficient fan samples to validate stability.")
 
+    # Sanity check: did the CPU temperature actually move during the run?
+    # If LHM cannot read MSRs (WinRing0 driver blocked by Memory Integrity,
+    # Smart App Control, antivirus, or missing admin), all
+    # SensorType.Temperature readings return None and our keyword-priority
+    # picker falls through to the motherboard NCT6798D "CPU" socket-pin
+    # sensor, which reads case ambient (~25-30 C) and doesn't move with
+    # CPU load. A perfectly flat trace fits any first-order model with
+    # R^2 = 1.0 trivially, producing a false-positive "GOOD" verdict.
+    # Catch this BEFORE the fit and bail out with an actionable error.
+    active = df[df.phase.isin(["response", "cooldown"])].copy()
+    temps = active.cpu_temp.dropna().astype(float).values
+    if len(temps) >= 10:
+        t_span = float(temps.max() - temps.min())
+        t_std = float(temps.std())
+        print(f"\n[temp-check] cpu_temp during run: min={temps.min():.2f}, "
+              f"max={temps.max():.2f}, span={t_span:.2f}, std={t_std:.3f}")
+        # Real CPU under busy-loop load varies by AT LEAST 5-15 C from
+        # idle to steady state. If we see <1 C of span over 480 s of
+        # heat+cool, the sensor is broken / wrong.
+        if t_span < 1.0:
+            print("\n" + "=" * 70)
+            print("DATA INVALID: CPU temperature did not move during the run")
+            print("=" * 70)
+            print(f"\nSpan = {t_span:.2f} C over {len(temps)} samples covering")
+            print("heating + cooldown phases. Under {} stress procs, the CPU".format(
+                args.stress_procs))
+            print("should have warmed by at least 5-15 C. A flat trace means")
+            print("LibreHardwareMonitor is reading the wrong sensor (likely the")
+            print("motherboard CPU-socket pin, which reads case ambient).")
+            print()
+            print("Most likely cause on Windows 11: Memory Integrity / HVCI")
+            print("blocks the WinRing0 kernel driver LHM needs to read CPU")
+            print("MSRs. Verify with:")
+            print()
+            print("    python Backend\\scripts\\dump_sensors.py")
+            print()
+            print("If P-Core / E-Core / CPU Package temperature sensors all")
+            print("show 'None' or 'stuck', disable Memory Integrity:")
+            print("    Settings -> Privacy and Security -> Windows Security")
+            print("    -> Device Security -> Core Isolation Details")
+            print("    -> Memory Integrity -> OFF -> REBOOT")
+            print()
+            print("CSV written for debugging: {}".format(csv_out))
+            sys.exit(2)
+        elif t_span < 5.0:
+            print(f"[temp-check] WARNING: span is only {t_span:.2f} C. The fit")
+            print("            may converge but the model will be poorly")
+            print("            constrained. Consider re-running with more")
+            print("            stress procs (--stress-procs ...).")
+
     # Fit heating phase
     resp = df[df.phase == "response"].copy()
     cool = df[df.phase == "cooldown"].copy()
