@@ -40,15 +40,24 @@ def main():
 
     # Force fresh sensor reads, just like _lhm_read does each tick.
     from LibreHardwareMonitor.Hardware import SensorType
+    # Key by int() so lookups using int(s.SensorType) match. Using the
+    # enum members directly as keys fails because we later look up by
+    # int() values.
     type_names = {
-        SensorType.Voltage: "Voltage", SensorType.Clock: "Clock",
-        SensorType.Temperature: "Temperature", SensorType.Load: "Load",
-        SensorType.Fan: "Fan", SensorType.Flow: "Flow",
-        SensorType.Control: "Control", SensorType.Level: "Level",
-        SensorType.Factor: "Factor", SensorType.Power: "Power",
-        SensorType.Data: "Data", SensorType.SmallData: "SmallData",
-        SensorType.Throughput: "Throughput",
-        SensorType.Frequency: "Frequency",
+        int(SensorType.Voltage): "Voltage",
+        int(SensorType.Clock): "Clock",
+        int(SensorType.Temperature): "Temperature",
+        int(SensorType.Load): "Load",
+        int(SensorType.Fan): "Fan",
+        int(SensorType.Flow): "Flow",
+        int(SensorType.Control): "Control",
+        int(SensorType.Level): "Level",
+        int(SensorType.Factor): "Factor",
+        int(SensorType.Power): "Power",
+        int(SensorType.Data): "Data",
+        int(SensorType.SmallData): "SmallData",
+        int(SensorType.Throughput): "Throughput",
+        int(SensorType.Frequency): "Frequency",
     }
 
     # Pass 1: do TWO updates 0.5s apart to expose stale-value sensors.
