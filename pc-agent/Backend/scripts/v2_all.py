@@ -56,15 +56,22 @@ def cooldown_between(hw, secs=60.0):
 def _hold(hw, pct, settle, window):
     v2.set_all_fans(hw, pct)
     temps = []
+    last = {"t": None}
 
     def on_tick(t_rel, row, dt):
         v2.set_all_fans(hw, pct)
-        if t_rel >= settle - window and row["cpu_temp"] is not None:
-            temps.append(float(row["cpu_temp"]))
+        if row["cpu_temp"] is not None:
+            last["t"] = float(row["cpu_temp"])
+            if t_rel >= settle - window:
+                temps.append(float(row["cpu_temp"]))
         if int(t_rel) % 20 == 0:
             print(f"[band]  {pct:.0f}%  t={t_rel:4.0f}s  cpu={row['cpu_temp']}C")
     v2.control_loop(hw, settle, on_tick, period_s=2.0, safety=True)
-    return v2.mean(temps)
+    # If the phase stopped early (safety), the window may be empty — fall back
+    # to the last reading so we never return NaN.
+    if temps:
+        return v2.mean(temps)
+    return last["t"] if last["t"] is not None else float("nan")
 
 
 def measure_band(hw, procs, settle):
@@ -189,6 +196,9 @@ def main():
     try:
         # 1. band + gain (pre-warm inside, so 100% isn't measured from cold)
         floor, ceil, gain = measure_band(hw, args.procs, args.settle)
+        if floor != floor or ceil != ceil:  # NaN guard (no usable readings)
+            print("[all] WARN: banda necitita; folosesc valori implicite.")
+            floor, ceil, gain = 75.0, 80.0, 0.0
         cooldown_between(hw, args.cooldown)
         lo, hi = min(floor, ceil), max(floor, ceil)
         # setpoint: middle of the band unless given; keep it in a safe range

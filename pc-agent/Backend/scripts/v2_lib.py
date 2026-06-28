@@ -10,6 +10,7 @@ terminal — LibreHardwareMonitor needs admin to read sensors and write PWM.
 """
 
 import multiprocessing
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,9 +27,10 @@ try:
 except Exception:
     pass
 
-# Abort any run if CPU crosses this — keeps us clear of the hardware
-# thermal-protection throttle (~95-100 C) that ruined the v1 runs.
-SAFE_MAX_C = 90.0
+# Stop a phase if CPU crosses this — keeps us clear of the hardware
+# thermal-protection throttle (~95-100 C). Overridable via env for testing
+# the safety path (THERM_SAFE_MAX=60 forces it to trigger in demo).
+SAFE_MAX_C = float(os.environ.get("THERM_SAFE_MAX", "90"))
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +103,10 @@ def _wait_until(deadline: float) -> None:
 def control_loop(hw, duration_s: float, on_tick, period_s: float = 2.0,
                  safety: bool = True) -> None:
     """Every period_s for duration_s, read sensors and call
-    on_tick(t_rel, row, dt). Aborts (RuntimeError) if cpu_temp > SAFE_MAX_C
-    while safety is True. period_s defaults to 2 s (the agent's interval)."""
+    on_tick(t_rel, row, dt). Returns "ok" normally, or "safety" if it stopped
+    this phase early because cpu_temp exceeded SAFE_MAX_C (it sets fans to
+    100% and returns; it NEVER raises, so one hot phase can't abort the whole
+    run). period_s defaults to 2 s (the agent's interval)."""
     t0 = time.monotonic()
     next_tick = t0
     last_t = None
@@ -110,20 +114,25 @@ def control_loop(hw, duration_s: float, on_tick, period_s: float = 2.0,
         now = time.monotonic()
         t_rel = now - t0
         if t_rel >= duration_s:
-            return
+            return "ok"
         dt = period_s if last_t is None else (t_rel - last_t)
         last_t = t_rel
         try:
             row = flat_sensors(hw)
             cpu = row["cpu_temp"]
-            if safety and cpu is not None and float(cpu) > SAFE_MAX_C:
-                raise RuntimeError(
-                    f"ABORT: cpu_temp {cpu}C > limita {SAFE_MAX_C}C la "
-                    f"t={t_rel:.0f}s. Reduce sarcina (--procs)."
-                )
+            # Record/act FIRST so even a phase that trips safety on its very
+            # first sample still captures a reading (otherwise callers that
+            # average readings would get an empty set -> NaN -> crash).
             on_tick(t_rel, row, dt)
-        except RuntimeError:
-            raise
+            if safety and cpu is not None and float(cpu) > SAFE_MAX_C:
+                print(f"[v2] SIGURANTA: cpu {cpu}C > {SAFE_MAX_C}C la "
+                      f"t={t_rel:.0f}s -> opresc faza si racesc (fani 100%).",
+                      file=sys.stderr)
+                try:
+                    set_all_fans(hw, 100.0)
+                except Exception:
+                    pass
+                return "safety"
         except Exception as e:
             print(f"[v2] read/control failed: {e}", file=sys.stderr)
         next_tick += period_s
