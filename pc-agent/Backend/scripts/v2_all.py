@@ -86,8 +86,9 @@ def measure_band(hw, procs, settle):
         print("[band] pre-incalzire 60s la 50% ...")
         _hold(hw, 50.0, 60.0, 10.0)
         floor = _hold(hw, 100.0, settle, 30.0)   # max cooling -> coolest
-        ceil = _hold(hw, 30.0, settle, 30.0)     # low cooling -> warmest
-    gain = (ceil - floor) / (100.0 - 30.0)       # >0 if fans actually cool
+        ceil = _hold(hw, 50.0, settle, 30.0)     # moderate cooling (safe: 50%
+        #                                          not 30% -> stays clear of 90C)
+    gain = (ceil - floor) / (100.0 - 50.0)       # >0 if fans actually cool
     print(f"[all] floor(100%)={floor:.1f}C ceiling(30%)={ceil:.1f}C gain={gain:.3f} C/%")
     return floor, ceil, gain
 
