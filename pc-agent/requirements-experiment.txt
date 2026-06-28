@@ -1,0 +1,20 @@
+# Minimal dependencies for running the desktop thermal-model experiment
+# (Backend/scripts/desktop_step_response.py).
+#
+# Does NOT include supabase / fastapi / keyring / realtime — none of
+# those are needed for a standalone experiment.
+#
+# Install on a fresh Python 3.11+ on Windows:
+#   pip install -r requirements-experiment.txt
+
+# Hardware access
+pythonnet>=3.0.3       # .NET bridge for LibreHardwareMonitor DLL
+psutil>=5.9.0          # CPU/memory metrics
+pywin32>=306           # pythoncom/win32 — WMI fan-RPM fallback (silences a warning)
+wmi>=1.5.1             # WMI wrapper used by the fan-read fallback
+
+# Experiment + fit + plot
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+matplotlib>=3.8
