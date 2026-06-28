@@ -40,10 +40,13 @@ from profiles import (  # noqa: E402
 SCEN_COLS = ["t_s", "cpu_temp", "cpu_load", "gpu_temp",
              "fan0_rpm", "fan0_pct", "fan1_rpm", "fan1_pct", "target_temp"]
 MODEL_COLS = ["t_s", "cpu_temp", "cpu_load", "gpu_temp", "fan0_pct", "phase"]
+# A representative QUIET fan curve (low fans until it gets hot). Kept quiet on
+# purpose so the open-loop baseline sits warm and the PID's ability to hold a
+# lower target stands out — a fair "silent curve vs. PID" comparison.
 DEFAULT_CURVE = [
-    {"temp": 40, "speed": 30}, {"temp": 55, "speed": 40},
-    {"temp": 70, "speed": 55}, {"temp": 80, "speed": 75},
-    {"temp": 90, "speed": 95}, {"temp": 95, "speed": 100},
+    {"temp": 40, "speed": 20}, {"temp": 60, "speed": 30},
+    {"temp": 78, "speed": 42}, {"temp": 86, "speed": 58},
+    {"temp": 92, "speed": 80}, {"temp": 97, "speed": 100},
 ]
 
 
@@ -143,18 +146,25 @@ def run_scenario(hw, mode, procs, duration, dt, out, *,
     pid = None
     if mode in ("pid", "pid-step"):
         pid = PidController(setpoint=st["sp"], kp=kp, ki=ki, kd=kd)
+    buf = []  # rolling median filter on the (noisy, 1C-quantized) temperature
 
     def on_tick(t_rel, row, dt_):
         temp = row["cpu_temp"]
         if temp is None:
             return
+        # Feed a SMOOTHED temperature to the controller so it doesn't chase
+        # the +-6C sensor bounce (that caused 0<->100% bang-bang at 2 procs).
+        buf.append(float(temp))
+        if len(buf) > 5:
+            buf.pop(0)
+        temp_ctrl = sorted(buf)[len(buf) // 2]
         if mode == "pid-step" and not st["switched"] and t_rel >= switch:
             pid.setpoint = float(t2)
             pid.reset()
             st["sp"] = t2
             st["switched"] = True
             print(f"[run] >>> t={t_rel:.0f}s setpoint {t1}->{t2}C")
-        pwm = pid.step(float(temp), dt_) if pid else ProfileEngine._interpolate(DEFAULT_CURVE, float(temp))
+        pwm = pid.step(temp_ctrl, dt_) if pid else ProfileEngine._interpolate(DEFAULT_CURVE, temp_ctrl)
         v2.set_all_fans(hw, pwm)
         r = dict(row)
         r["t_s"] = round(t_rel, 2)
@@ -223,6 +233,10 @@ def main():
             kp = tau / (gain * lam)
             ki = kp / tau
             kd = kp * (tau / 20.0)
+        # Cap to gentle values: on a noisy, low-authority temperature signal,
+        # large gains cause 0<->100% bang-bang (observed at 2 procs).
+        kp = min(kp, 5.0)
+        kd = min(kd, 1.0)
         print(f"[all] === GAINS Kp={kp:.2f} Ki={ki:.3f} Kd={kd:.3f} ===")
 
         # 4. scenarios

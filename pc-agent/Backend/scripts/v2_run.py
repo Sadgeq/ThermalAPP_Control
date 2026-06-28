@@ -35,11 +35,12 @@ from profiles import (  # noqa: E402
 COLUMNS = ["t_s", "cpu_temp", "cpu_load", "gpu_temp",
            "fan0_rpm", "fan0_pct", "fan1_rpm", "fan1_pct", "target_temp"]
 
-# Representative open-loop fan curve (temp C -> fan %), used by --mode curve.
+# Representative QUIET open-loop fan curve (temp C -> fan %): low fans until
+# it gets hot, so the baseline sits warm and the PID's lower target stands out.
 DEFAULT_CURVE = [
-    {"temp": 40, "speed": 30}, {"temp": 55, "speed": 40},
-    {"temp": 70, "speed": 55}, {"temp": 80, "speed": 75},
-    {"temp": 90, "speed": 95}, {"temp": 95, "speed": 100},
+    {"temp": 40, "speed": 20}, {"temp": 60, "speed": 30},
+    {"temp": 78, "speed": 42}, {"temp": 86, "speed": 58},
+    {"temp": 92, "speed": 80}, {"temp": 97, "speed": 100},
 ]
 
 
@@ -57,10 +58,16 @@ def run(args):
     else:
         print("[run] curve mode (open loop)")
 
+    buf = []  # rolling median on the noisy temperature fed to the controller
+
     def on_tick(t_rel, row, dt):
         temp = row["cpu_temp"]
         if temp is None:
             return
+        buf.append(float(temp))
+        if len(buf) > 5:
+            buf.pop(0)
+        temp_ctrl = sorted(buf)[len(buf) // 2]
 
         # setpoint step (once)
         if args.mode == "pid-step" and not state["switched"] and t_rel >= args.switch:
@@ -71,9 +78,9 @@ def run(args):
             print(f"[run] >>> t={t_rel:.0f}s  setpoint {args.t1} -> {args.t2}C")
 
         if pid is not None:
-            pwm = pid.step(measured=float(temp), dt=dt)
+            pwm = pid.step(measured=temp_ctrl, dt=dt)
         else:
-            pwm = ProfileEngine._interpolate(DEFAULT_CURVE, float(temp))
+            pwm = ProfileEngine._interpolate(DEFAULT_CURVE, temp_ctrl)
         v2.set_all_fans(hw, pwm)
 
         r = dict(row)
