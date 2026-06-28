@@ -32,7 +32,10 @@ import numpy as np  # noqa: E402
 from scipy.optimize import curve_fit  # noqa: E402
 
 import v2_lib as v2  # noqa: E402
-from profiles import PidController, ProfileEngine  # noqa: E402
+from profiles import (  # noqa: E402
+    PidController, ProfileEngine,
+    PID_DEFAULT_KP, PID_DEFAULT_KI, PID_DEFAULT_KD,
+)
 
 SCEN_COLS = ["t_s", "cpu_temp", "cpu_load", "gpu_temp",
              "fan0_rpm", "fan0_pct", "fan1_rpm", "fan1_pct", "target_temp"]
@@ -67,10 +70,15 @@ def _hold(hw, pct, settle, window):
 def measure_band(hw, procs, settle):
     print(f"[all] === BAND ({procs} procs) ===")
     with v2.CpuStress(n_processes=procs):
-        floor = _hold(hw, 100.0, settle, 30.0)
-        ceil = _hold(hw, 30.0, settle, 30.0)
-    gain = abs((ceil - floor) / (100.0 - 30.0))
-    print(f"[all] floor={floor:.1f}C ceiling={ceil:.1f}C gain={gain:.3f} C/%")
+        # Pre-warm so the first (100%) hold doesn't start from a cold CPU —
+        # otherwise its average is contaminated by the warm-up transient and
+        # can read HOTTER than the 30% hold (false "fans do nothing").
+        print("[band] pre-incalzire 60s la 50% ...")
+        _hold(hw, 50.0, 60.0, 10.0)
+        floor = _hold(hw, 100.0, settle, 30.0)   # max cooling -> coolest
+        ceil = _hold(hw, 30.0, settle, 30.0)     # low cooling -> warmest
+    gain = (ceil - floor) / (100.0 - 30.0)       # >0 if fans actually cool
+    print(f"[all] floor(100%)={floor:.1f}C ceiling(30%)={ceil:.1f}C gain={gain:.3f} C/%")
     return floor, ceil, gain
 
 
@@ -158,8 +166,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--procs", type=int, required=True,
                    help="calibrated stress procs (from v2_calibrate --plateau)")
-    p.add_argument("--model-procs", type=int, default=6,
-                   help="stronger load for a clear model swing (default 6)")
+    p.add_argument("--model-procs", type=int, default=None,
+                   help="load for the model swing (default = same as --procs, "
+                        "so it never throttles)")
     p.add_argument("--setpoint", type=float, default=None,
                    help="PID setpoint (default = middle of the band)")
     p.add_argument("--duration", type=float, default=300.0)
@@ -173,33 +182,38 @@ def main():
     p.add_argument("--outdir", type=Path, default=Path("data"))
     p.add_argument("--figdir", type=Path, default=Path("figures_v2"))
     args = p.parse_args()
+    # Model uses the SAME calibrated load by default, so it never throttles.
+    model_procs = args.model_procs if args.model_procs is not None else args.procs
 
     hw = v2.make_hw()
     try:
-        # 1. band + gain
+        # 1. band + gain (pre-warm inside, so 100% isn't measured from cold)
         floor, ceil, gain = measure_band(hw, args.procs, args.settle)
-        if gain < 0.02:
-            print(f"[all] WARN: castig de proces foarte mic ({gain:.3f}); "
-                  f"folosesc 0.20 C/%. (Pe hardware real ar trebui ~0.2.)")
-            gain = 0.20
         cooldown_between(hw, args.cooldown)
-        # setpoint: middle of band unless given; keep strictly inside band
-        sp = args.setpoint if args.setpoint is not None else round((floor + ceil) / 2)
-        sp = max(floor + 1, min(ceil - 1, sp))
-        t1 = min(ceil - 1, sp + 4)
-        t2 = max(floor + 1, sp - 4)
+        lo, hi = min(floor, ceil), max(floor, ceil)
+        # setpoint: middle of the band unless given; keep it in a safe range
+        sp = args.setpoint if args.setpoint is not None else round((lo + hi) / 2)
+        sp = max(45.0, min(85.0, sp))
+        t1 = min(85.0, sp + 3)
+        t2 = max(45.0, sp - 3)
 
-        # 2. model
+        # 2. model (calibrated load, NOT a hotter one -> avoids throttle/abort)
         model_csv = args.outdir / "v2_model.csv"
-        tau, K, r2 = identify_model(hw, args.model_procs, args.heat, args.cool, 3.0, model_csv)
+        tau, K, r2 = identify_model(hw, model_procs, args.heat, args.cool, 3.0, model_csv)
         cooldown_between(hw, args.cooldown)
 
-        # 3. tune (IMC)
+        # 3. tune: IMC from the model when fans have real authority; otherwise
+        # fall back to the empirical gains (low fan authority -> IMC blows up).
         lam = args.lam if args.lam is not None else tau
-        kp = tau / (gain * lam)
-        ki = kp / tau
-        kd = kp * (tau / 20.0)
-        print(f"[all] === GAINS (IMC) Kp={kp:.2f} Ki={ki:.3f} Kd={kd:.2f} ===")
+        if gain < 0.05:
+            print(f"[all] WARN: autoritate redusa a ventilatoarelor (gain={gain:.3f} "
+                  f"C/%); folosesc gains empirice implicite in loc de IMC.")
+            kp, ki, kd = PID_DEFAULT_KP, PID_DEFAULT_KI, PID_DEFAULT_KD
+        else:
+            kp = tau / (gain * lam)
+            ki = kp / tau
+            kd = kp * (tau / 20.0)
+        print(f"[all] === GAINS Kp={kp:.2f} Ki={ki:.3f} Kd={kd:.3f} ===")
 
         # 4. scenarios
         curve_csv = args.outdir / "v2_curve.csv"
@@ -220,7 +234,7 @@ def main():
 
     # 5. summary
     summary = (
-        f"procs={args.procs} model_procs={args.model_procs}\n"
+        f"procs={args.procs} model_procs={model_procs}\n"
         f"band: floor={floor:.1f}C ceiling={ceil:.1f}C gain={gain:.3f} C/%\n"
         f"model: tau={tau:.1f}s K={K:.1f}C R2={r2:.3f}\n"
         f"gains(IMC,lam={lam:.0f}): Kp={kp:.2f} Ki={ki:.3f} Kd={kd:.2f}\n"
