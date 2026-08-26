@@ -3,6 +3,7 @@ import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { AuthProvider, useAuth } from "@/lib/auth-context";
 import { colors } from "@/lib/theme";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 function RootNavigation() {
   const { session, loading } = useAuth();
@@ -38,9 +39,11 @@ function RootNavigation() {
 
 export default function RootLayout() {
   return (
-    <AuthProvider>
-      <StatusBar style="light" />
-      <RootNavigation />
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <StatusBar style="light" />
+        <RootNavigation />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

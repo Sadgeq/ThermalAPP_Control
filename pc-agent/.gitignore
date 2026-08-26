@@ -14,3 +14,10 @@ venv/
 
 # LibreHardwareMonitor runtime config (mutated on every run)
 Backend/lib/LibreHardwareMonitor.config
+
+# PyInstaller build artifacts. The dist/agent/ folder needs to exist (Tauri's
+# build script validates the resource path) but its contents are regenerated
+# from agent.spec — only keep the placeholder README in source control.
+build/
+dist/agent/*
+!dist/agent/README.txt

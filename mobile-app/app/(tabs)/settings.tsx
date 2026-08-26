@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -9,9 +9,23 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
+import Constants from "expo-constants";
+import * as Haptics from "expo-haptics";
 import { useAuth } from "@/lib/auth-context";
 import { useDevices } from "@/hooks/useDevices";
+import { supabase } from "@/lib/supabase";
 import { colors, radius, spacing, type } from "@/lib/theme";
+
+// Bounds enforced by the agent + by the SQL CHECK on the alert_settings
+// table. Mirroring them here means an out-of-range value is impossible to
+// dispatch from the UI.
+const ALERT_TEMP_MIN = 50;
+const ALERT_TEMP_MAX = 100;
+
+// Mobile app version comes from app.json (managed by Expo) so a build's
+// version is what the user actually has, not a hardcoded string that
+// drifted from reality.
+const MOBILE_APP_VERSION = Constants.expoConfig?.version ?? "—";
 
 export default function SettingsScreen() {
   const router = useRouter();
@@ -77,6 +91,16 @@ export default function SettingsScreen() {
             value={device?.hardware_id ? `${device.hardware_id.slice(0, 8)}…` : "—"}
             mono
           />
+          <Row
+            label="Driver"
+            value={device?.controller || "—"}
+            mono
+          />
+          <Row
+            label="Agent version"
+            value={device?.app_version || "—"}
+            mono
+          />
           <StatusRow
             label="Status"
             online={!!device?.is_online}
@@ -84,9 +108,17 @@ export default function SettingsScreen() {
           />
         </Section>
 
+        {/* Alert thresholds — editable from mobile. The agent reads
+            these from the alert_settings table at boot and re-checks on
+            each sensor tick. Updating the row triggers cloud realtime
+            but the agent's monitoring loop also reads them every cycle,
+            so changes apply within ~2 seconds. */}
+        {selectedId && (
+          <ThresholdsSection deviceId={selectedId} />
+        )}
+
         <Section label="App">
-          <Row label="Version" value="1.0.0" />
-          <Row label="Agent protocol" value="v3.2" last />
+          <Row label="Mobile version" value={MOBILE_APP_VERSION} last />
         </Section>
 
         <TouchableOpacity
@@ -108,6 +140,128 @@ export default function SettingsScreen() {
         <View style={{ height: spacing.xxxl }} />
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+// Editor for CPU/GPU alert thresholds. Reads from public.alert_settings
+// for the selected device, lets the user adjust each by 1°C, and writes
+// back via upsert. The agent reads alert_settings at boot and on each
+// monitoring tick, so changes propagate within ~2 seconds.
+function ThresholdsSection({ deviceId }: { deviceId: string }) {
+  type Row = { metric: "cpu_temp" | "gpu_temp"; threshold: number };
+  const [rows, setRows] = useState<Row[]>([
+    { metric: "cpu_temp", threshold: 85 },
+    { metric: "gpu_temp", threshold: 85 },
+  ]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const fetch = async () => {
+      const { data } = await supabase
+        .from("alert_settings")
+        .select("metric, threshold")
+        .eq("device_id", deviceId);
+      if (!alive) return;
+      if (data && data.length > 0) {
+        const cpu = data.find((d: any) => d.metric === "cpu_temp");
+        const gpu = data.find((d: any) => d.metric === "gpu_temp");
+        setRows([
+          { metric: "cpu_temp", threshold: cpu?.threshold ?? 85 },
+          { metric: "gpu_temp", threshold: gpu?.threshold ?? 85 },
+        ]);
+      }
+      setLoaded(true);
+    };
+    fetch();
+    return () => { alive = false; };
+  }, [deviceId]);
+
+  const update = async (metric: Row["metric"], delta: number) => {
+    Haptics.selectionAsync();
+    const current = rows.find((r) => r.metric === metric)?.threshold ?? 85;
+    const next = Math.max(ALERT_TEMP_MIN, Math.min(ALERT_TEMP_MAX, current + delta));
+    if (next === current) return;
+
+    setRows((prev) =>
+      prev.map((r) => (r.metric === metric ? { ...r, threshold: next } : r))
+    );
+
+    try {
+      const { error } = await supabase
+        .from("alert_settings")
+        .upsert(
+          {
+            device_id: deviceId,
+            metric,
+            threshold: next,
+            enabled: true,
+            cooldown_minutes: 5,
+          },
+          { onConflict: "device_id,metric" }
+        );
+      if (error) throw error;
+    } catch (e: any) {
+      Alert.alert("Couldn't save threshold", e?.message ?? String(e));
+    }
+  };
+
+  if (!loaded) {
+    return (
+      <Section label="Praguri alertă">
+        <Row label="Loading…" value="" last />
+      </Section>
+    );
+  }
+
+  return (
+    <Section label="Praguri alertă (°C)">
+      {rows.map((r, i) => (
+        <ThresholdRow
+          key={r.metric}
+          label={r.metric === "cpu_temp" ? "CPU critical" : "GPU critical"}
+          value={r.threshold}
+          onMinus={() => update(r.metric, -1)}
+          onPlus={() => update(r.metric, +1)}
+          last={i === rows.length - 1}
+        />
+      ))}
+    </Section>
+  );
+}
+
+function ThresholdRow({
+  label, value, onMinus, onPlus, last,
+}: {
+  label: string;
+  value: number;
+  onMinus: () => void;
+  onPlus: () => void;
+  last?: boolean;
+}) {
+  return (
+    <View style={[styles.row, !last && styles.rowBorder]}>
+      <Text style={styles.rowLabel}>{label}</Text>
+      <View style={styles.thresholdControls}>
+        <TouchableOpacity
+          onPress={onMinus}
+          style={styles.thresholdStep}
+          disabled={value <= ALERT_TEMP_MIN}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.thresholdStepText}>−</Text>
+        </TouchableOpacity>
+        <Text style={styles.thresholdValue}>{value}°</Text>
+        <TouchableOpacity
+          onPress={onPlus}
+          style={styles.thresholdStep}
+          disabled={value >= ALERT_TEMP_MAX}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.thresholdStepText}>+</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
   );
 }
 
@@ -257,6 +411,34 @@ const styles = StyleSheet.create({
   rowValueMono: {
     ...type.mono,
     color: colors.text2,
+  },
+  thresholdControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  thresholdStep: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: colors.bg2,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  thresholdStepText: {
+    fontSize: 18,
+    color: colors.text0,
+    fontWeight: "300",
+    lineHeight: 20,
+  },
+  thresholdValue: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: colors.accent,
+    minWidth: 44,
+    textAlign: "center",
   },
 
   statusChip: {

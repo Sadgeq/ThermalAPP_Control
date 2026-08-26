@@ -1,8 +1,11 @@
 import { useState, useEffect } from "react";
 import { useTheme } from "../lib/ThemeContext";
 import { useAuth } from "../lib/AuthContext";
-import { fetchStatus, StatusData } from "../lib/api";
+import { fetchStatus, StatusData, resetPairing } from "../lib/api";
 import Card from "../components/Card";
+import { getVersion } from "@tauri-apps/api/app";
+import { check } from "@tauri-apps/plugin-updater";
+import { sendNotification } from "../lib/notify";
 
 export const SETTINGS_KEY = "tc-settings";
 
@@ -43,17 +46,66 @@ async function syncThresholdsToAgent(s: AppSettings) {
   ]);
 }
 
+type UpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "uptodate" }
+  | { kind: "available"; version: string }
+  | { kind: "installing" }
+  | { kind: "error"; message: string };
+
 export default function Settings() {
-  const { colors, theme, toggle } = useTheme();
+  const { colors, theme, pref: themePref, toggle } = useTheme();
   const { session, signOut } = useAuth();
   const [status, setStatus] = useState<StatusData | null>(null);
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const [synced, setSynced] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>("");
+  const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
 
   useEffect(() => { fetchStatus().then((d) => { if (d) setStatus(d); }); }, []);
   useEffect(() => {
     if (settings.enableNotifications && "Notification" in window && Notification.permission === "default") Notification.requestPermission();
   }, [settings.enableNotifications]);
+  // Load Tauri's reported app version once. Tauri reads this from
+  // tauri.conf.json — that's the canonical source.
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(""));
+  }, []);
+
+  const checkForUpdates = async () => {
+    setUpdateState({ kind: "checking" });
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateState({ kind: "uptodate" });
+        return;
+      }
+      setUpdateState({ kind: "available", version: update.version });
+      // Don't auto-install — let the user click the button below to confirm.
+      // We just store the update object on window for the install handler
+      // to retrieve (cleaner than threading state through more hooks).
+      (window as any).__pendingUpdate = update;
+    } catch (e: any) {
+      // Most common error in the absence of an endpoint config: 'plugin
+      // not configured'. Show the raw message — operators can act on it.
+      setUpdateState({ kind: "error", message: String(e?.message ?? e) });
+    }
+  };
+
+  const installUpdate = async () => {
+    const update = (window as any).__pendingUpdate;
+    if (!update) return;
+    setUpdateState({ kind: "installing" });
+    try {
+      await update.downloadAndInstall();
+      // downloadAndInstall typically restarts the app — we won't reach here
+      // unless the relaunch hook fails.
+      setUpdateState({ kind: "uptodate" });
+    } catch (e: any) {
+      setUpdateState({ kind: "error", message: String(e?.message ?? e) });
+    }
+  };
 
   const updateSetting = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setSettings((prev) => {
@@ -88,9 +140,19 @@ export default function Settings() {
             <ToggleRow label="Cloud sync" description="Sync profiles and commands via Supabase" value={settings.enableCloudSync} onChange={(v) => updateSetting("enableCloudSync", v)} colors={colors} />
             <div style={{ height: 1, background: colors.border, margin: "4px 0" }} />
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: colors.bg0, borderRadius: 8 }}>
+              <span style={{ fontSize: 13, color: colors.text1 }}>Test notification</span>
+              <button
+                onClick={() => sendNotification("ThermalControl", "Test notification — your alerts are set up correctly.")}
+                style={{ padding: "5px 14px", borderRadius: 6, border: `0.5px solid ${colors.border2}`, background: "transparent", color: colors.text1, fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}
+                title="Send a notification right now to verify OS permissions and routing"
+              >
+                Send test
+              </button>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: colors.bg0, borderRadius: 8 }}>
               <span style={{ fontSize: 13, color: colors.text1 }}>Theme</span>
               <button onClick={toggle} style={{ padding: "5px 14px", borderRadius: 6, border: `0.5px solid ${colors.accentBorder}`, background: colors.accentSoft, color: colors.accent, fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
-                {theme === "light" ? "Switch to dark" : "Switch to light"}
+                {themePref === "system" ? `System (${theme})` : themePref === "light" ? "Light" : "Dark"}
               </button>
             </div>
           </div>
@@ -101,19 +163,99 @@ export default function Settings() {
             <InfoPill label="User ID" value={session?.user?.id ? session.user.id.slice(0, 12) + "..." : "—"} colors={colors} />
             <InfoPill label="Provider" value={session?.user?.app_metadata?.provider || "email"} colors={colors} />
             <button onClick={signOut} style={{ marginTop: 8, padding: "10px 16px", borderRadius: 8, border: `0.5px solid ${colors.danger}30`, background: colors.dangerSoft, color: colors.danger, fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "'Inter', sans-serif" }}>Sign out</button>
+            <ResetPairingButton colors={colors} />
           </div>
         </Card>
         <Card label="Agent" subLabel="Backend status">
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <InfoPill label="Status" value={status?.status || "Unknown"} colors={colors} accent={status?.status === "running"} />
+            <InfoPill label="Version" value={status?.version || "—"} colors={colors} />
             <InfoPill label="Device" value={status?.device_name || "—"} colors={colors} />
             <InfoPill label="Device ID" value={status?.device_id ? status.device_id.slice(0, 12) + "..." : "—"} colors={colors} />
-            <InfoPill label="Mode" value={status?.demo_mode ? "Demo" : "Hardware (Legion EC)"} colors={colors} />
             <InfoPill label="Fans" value={status?.fan_count?.toString() || "0"} colors={colors} />
             <InfoPill label="Cloud" value={status?.cloud_connected ? "Connected" : "Disconnected"} colors={colors} accent={status?.cloud_connected} />
             <InfoPill label="Endpoint" value="127.0.0.1:8420" colors={colors} />
           </div>
         </Card>
+        <Card label="Hardware" subLabel="Driver and capabilities">
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <InfoPill label="Vendor" value={status?.vendor || "—"} colors={colors} />
+            <InfoPill label="Model" value={status?.model || "—"} colors={colors} />
+            <InfoPill label="Driver" value={status?.controller || (status?.demo_mode ? "demo" : "—")} colors={colors} />
+            <InfoPill label="Sensors" value={status?.capabilities?.sensors ? "Supported" : "Unavailable"} colors={colors} accent={status?.capabilities?.sensors} />
+            <InfoPill label="Fan speed" value={status?.capabilities?.fan_speed ? "Supported" : "Not supported"} colors={colors} accent={status?.capabilities?.fan_speed} />
+            <InfoPill label="Fan mode" value={status?.capabilities?.fan_mode ? "Supported" : "Not supported"} colors={colors} accent={status?.capabilities?.fan_mode} />
+          </div>
+        </Card>
+        <Card label="About" subLabel="Version and updates">
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <InfoPill label="Desktop app" value={appVersion || "—"} colors={colors} />
+            <InfoPill label="Agent" value={status?.version || "—"} colors={colors} />
+            <UpdateRow state={updateState} onCheck={checkForUpdates} onInstall={installUpdate} colors={colors} />
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function UpdateRow({
+  state, onCheck, onInstall, colors,
+}: {
+  state: UpdateState;
+  onCheck: () => void;
+  onInstall: () => void;
+  colors: any;
+}) {
+  // Status messaging tracks state.kind. The check button is always visible
+  // so a user can re-trigger after an error. The install button only shows
+  // when an update is actually pending.
+  let status: string;
+  let accent: boolean | undefined;
+  switch (state.kind) {
+    case "idle": status = "Click to check"; break;
+    case "checking": status = "Checking…"; break;
+    case "uptodate": status = "Up to date"; accent = true; break;
+    case "available": status = `New version ${state.version} available`; accent = true; break;
+    case "installing": status = "Downloading…"; break;
+    case "error": status = `Error: ${state.message.slice(0, 80)}`; break;
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "10px 12px", background: colors.bg0, borderRadius: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 12, color: colors.text2 }}>Updates</span>
+        <span style={{
+          fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 500,
+          color: state.kind === "error" ? colors.danger : (accent ? colors.accent : colors.text1),
+          maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>
+          {status}
+        </span>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 2 }}>
+        <button
+          onClick={onCheck}
+          disabled={state.kind === "checking" || state.kind === "installing"}
+          style={{
+            flex: 1, padding: "6px 10px", fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
+            borderRadius: 6, border: `0.5px solid ${colors.border2}`,
+            background: "transparent", color: colors.text1, cursor: "pointer",
+          }}
+        >
+          Check for updates
+        </button>
+        {state.kind === "available" && (
+          <button
+            onClick={onInstall}
+            style={{
+              flex: 1, padding: "6px 10px", fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
+              borderRadius: 6, border: `0.5px solid ${colors.accentBorder}`,
+              background: colors.accentSoft, color: colors.accent, cursor: "pointer",
+            }}
+          >
+            Install &amp; restart
+          </button>
+        )}
       </div>
     </div>
   );
@@ -157,5 +299,59 @@ function InfoPill({ label, value, colors, accent }: { label: string; value: stri
       <span style={{ fontSize: 12, color: colors.text2 }}>{label}</span>
       <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 500, color: accent ? colors.accent : colors.text0, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
     </div>
+  );
+}
+
+// Two-step confirm pattern: first click arms the destructive action, second
+// click within 4s commits it. Avoids needing a modal dialog for what's a
+// rare action. After arming, the button visually warns (danger color +
+// "Confirm reset") and reverts to neutral if the user doesn't follow up.
+function ResetPairingButton({ colors }: { colors: any }) {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  const handle = async () => {
+    if (busy) return;
+    if (!armed) { setArmed(true); return; }
+    setBusy(true);
+    const ok = await resetPairing();
+    setBusy(false);
+    setArmed(false);
+    if (ok) setDone(true);
+  };
+
+  if (done) {
+    return (
+      <div style={{ marginTop: 4, padding: "10px 12px", borderRadius: 8, background: colors.warnSoft, color: colors.warn, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.4 }}>
+        Pairing cleared. Restart the agent to re-pair from mobile.
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={handle}
+      disabled={busy}
+      style={{
+        marginTop: 4,
+        padding: "10px 16px", borderRadius: 8,
+        border: `0.5px solid ${armed ? colors.danger : colors.border2}`,
+        background: armed ? colors.dangerSoft : "transparent",
+        color: armed ? colors.danger : colors.text2,
+        fontSize: 12, fontWeight: 500,
+        cursor: busy ? "wait" : "pointer",
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: "all 0.15s ease",
+      }}
+    >
+      {busy ? "Resetting…" : armed ? "Click again to confirm" : "Reset pairing"}
+    </button>
   );
 }

@@ -29,6 +29,22 @@ export type StatusData = {
   cloud_connected: boolean;
   active_profile: string | null;
   fan_count: number;
+  // Agent version (semver). Surfaced in the Settings → Agent card so users
+  // can answer 'what build am I on?' at a glance.
+  version?: string;
+  // Hardware fingerprint + capability flags. Controller is a stable
+  // identifier ('lenovo-legion-wmi', 'lhm-pwm', 'demo', ...) the UI can
+  // show in 'Driver' fields. Capabilities gate fan-control widgets so
+  // sensors-only platforms don't render dead buttons.
+  vendor?: string;
+  model?: string;
+  controller?: string;
+  capabilities?: {
+    sensors: boolean;
+    fan_speed: boolean;
+    fan_mode: boolean;
+    demo: boolean;
+  };
 };
 
 export type ProfileData = {
@@ -36,6 +52,8 @@ export type ProfileData = {
     id: string;
     name: string;
     fan_curve: { temp: number; speed: number }[];
+    // Lenovo Legion BIOS mode flipped on activation. null = leave BIOS alone.
+    fan_mode: FanMode | null;
     is_active: boolean;
   }>;
   active: string | null;
@@ -109,6 +127,18 @@ export async function setFanMode(mode: FanMode): Promise<boolean> {
 export async function fetchAlertLog(): Promise<{ alerts: any[] }> {
   const data = await safeFetch(`${BASE}/api/alert-log`);
   return data || { alerts: [] };
+}
+
+export async function fetchDiag(): Promise<any | null> {
+  return safeFetch(`${BASE}/api/diag`);
+}
+
+export async function resetPairing(): Promise<boolean> {
+  const res = await safeFetch(`${BASE}/api/reset-pairing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  return res?.ok === true;
 }
 
 export async function fetchHistory(): Promise<{ history: any[] }> {

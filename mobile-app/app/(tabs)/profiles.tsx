@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -20,14 +20,20 @@ type Profile = {
   name: string;
   is_active: boolean;
   fan_curve: { temp: number; speed: number }[];
+  // 1=Quiet, 2=Balanced, 3=Performance — Lenovo Legion BIOS mode.
+  // null/undefined means the profile doesn't change the BIOS mode.
+  fan_mode: number | null;
+  // PID setpoint in °C. When set, the agent runs a closed-loop controller
+  // that holds the CPU at this temperature instead of using fan_curve.
+  // null means the profile uses fan_curve mode.
+  target_temp: number | null;
 };
 
-const PROFILE_TO_MODE: Record<string, number> = {
-  Silent: 1,
-  Balanced: 2,
-  Gaming: 3,
-  Turbo: 3,
-};
+// Bounds for the target-temperature slider. Mirror the SQL CHECK
+// constraint in supabase/migrations/0014_profiles_target_temp.sql.
+const TARGET_TEMP_MIN = 50;
+const TARGET_TEMP_MAX = 90;
+const TARGET_TEMP_STEP = 1;
 
 const DESCRIPTIONS: Record<string, string> = {
   Silent: "Lowest fan caps. Quietest under load.",
@@ -48,6 +54,12 @@ export default function ProfilesScreen() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
   const [activating, setActivating] = useState<string | null>(null);
+  // Debounce timer for target_temp persistence. The +/- steppers fire one
+  // saveTargetTemp per tap; without debouncing, going from 55°C to 80°C
+  // ends up enqueuing 25 set_profile commands at the agent and trips the
+  // 30-cmd/min rate limit. We wait until the user pauses for 600ms, then
+  // persist the *final* value once.
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchProfiles = async () => {
     if (!selectedId) return;
@@ -119,7 +131,8 @@ export default function ProfilesScreen() {
       );
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (e: any) {
-      Alert.alert("Failed", e.message);
+      const { title, body } = humanizeCommandError(e);
+      Alert.alert(title, body);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       fetchProfiles();
     } finally {
@@ -127,7 +140,88 @@ export default function ProfilesScreen() {
     }
   };
 
+  // Translate the database-level errors raised by 0002_command_validator.sql
+  // into something a user can act on. The Postgres error message bubbles up
+  // verbatim through PostgREST → supabase-js → here, so we pattern-match
+  // the message text rather than relying on error codes (which the JS
+  // client doesn't always expose).
+  function humanizeCommandError(e: any): { title: string; body: string } {
+    const msg = String(e?.message ?? e ?? "").toLowerCase();
+    if (msg.includes("rate limit") || msg.includes("too_many")) {
+      return {
+        title: "Slow down",
+        body: "You've sent more than 30 commands in a minute. Wait about a minute, then try again.",
+      };
+    }
+    if (msg.includes("not allowed") || msg.includes("command_type")) {
+      return {
+        title: "Outdated app",
+        body: "This action isn't supported by the agent on your PC. Update the desktop app.",
+      };
+    }
+    if (msg.includes("profile_name") || msg.includes("invalid characters")) {
+      return {
+        title: "Bad profile name",
+        body: "Profile names can only contain letters, numbers, spaces, hyphens, and underscores.",
+      };
+    }
+    return { title: "Couldn't change profile", body: e?.message ?? "Unknown error" };
+  }
+
   const activeProfile = profiles.find((p) => p.is_active);
+
+  // Persist a target_temp change for the active profile. null = switch
+  // back to fan-curve mode. After the row update we send a `set_profile`
+  // command if this profile is currently active, which makes the agent
+  // re-fetch profiles from cloud and rebuild the PID controller against
+  // the new setpoint.
+  //
+  // Debounced (600ms) so a quick burst of +/- taps coalesces into a
+  // single network round-trip. The UI is updated optimistically on every
+  // tap so the value the user sees feels instant. We commit the *latest*
+  // value only after the user pauses.
+  const saveTargetTemp = (profileId: string, value: number | null) => {
+    Haptics.selectionAsync();
+    // Optimistic local update — UI follows the finger immediately.
+    setProfiles((prev) =>
+      prev.map((p) => (p.id === profileId ? { ...p, target_temp: value } : p))
+    );
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      saveTimerRef.current = null;
+      try {
+        const { error } = await supabase
+          .from("profiles")
+          .update({ target_temp: value })
+          .eq("id", profileId);
+        if (error) throw error;
+
+        const updated = profiles.find((p) => p.id === profileId);
+        if (updated?.is_active && selectedId) {
+          const { error: cmdErr } = await supabase.from("commands").insert({
+            device_id: selectedId,
+            command_type: "set_profile",
+            payload: { profile_name: updated.name },
+            status: "pending",
+          });
+          if (cmdErr) {
+            console.warn("set_profile nudge failed:", cmdErr.message);
+          }
+        }
+      } catch (e: any) {
+        Alert.alert("Couldn't save", e?.message ?? String(e));
+      }
+    }, 600);
+  };
+
+  // Flush any pending save when the screen unmounts so a half-typed
+  // value doesn't get dropped silently.
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, []);
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -157,10 +251,18 @@ export default function ProfilesScreen() {
                 Mode
               </Text>
               <Text style={styles.activeHeroMode}>
-                {PROFILE_TO_MODE[activeProfile.name] ?? "—"}
+                {activeProfile.fan_mode ?? "—"}
               </Text>
             </View>
           </View>
+        )}
+
+        {/* PID setpoint editor for the active profile — closed-loop control. */}
+        {activeProfile && (
+          <TargetTempEditor
+            profile={activeProfile}
+            onChange={(v) => saveTargetTemp(activeProfile.id, v)}
+          />
         )}
 
         {loading ? (
@@ -179,7 +281,7 @@ export default function ProfilesScreen() {
             {profiles.map((p, i) => {
               const isActive = p.is_active;
               const isActivating = activating === p.name;
-              const mode = PROFILE_TO_MODE[p.name];
+              const mode = p.fan_mode;
               return (
                 <TouchableOpacity
                   key={p.id}
@@ -257,6 +359,108 @@ export default function ProfilesScreen() {
   );
 }
 
+// PID setpoint editor — sits below the active hero card. Two states:
+//
+//   * Curve mode (target_temp == null): shows just a single button
+//     "Activează reglare automată" that, on tap, sets target_temp to
+//     a sensible default (70 °C) so the user has something to adjust.
+//
+//   * Target mode (target_temp != null): shows the current setpoint
+//     prominently with - / + steppers (1°C each) and a "Înapoi la curbă"
+//     button to revert to fan_curve mode.
+//
+// Every change writes to Supabase immediately. The agent picks up via
+// realtime within ~2 s (or on its next poll otherwise) and re-creates
+// its PID controller against the new setpoint without losing position.
+function TargetTempEditor({
+  profile, onChange,
+}: {
+  profile: Profile;
+  onChange: (value: number | null) => void;
+}) {
+  const isPid = profile.target_temp !== null;
+  const value = profile.target_temp ?? 70;
+
+  const dec = () => {
+    if (!isPid) return;
+    const next = Math.max(TARGET_TEMP_MIN, value - TARGET_TEMP_STEP);
+    if (next !== value) onChange(next);
+  };
+  const inc = () => {
+    if (!isPid) return;
+    const next = Math.min(TARGET_TEMP_MAX, value + TARGET_TEMP_STEP);
+    if (next !== value) onChange(next);
+  };
+  const enable = () => onChange(70);
+  const disable = () => onChange(null);
+
+  return (
+    <View style={styles.pidCard}>
+      <View style={styles.pidHeader}>
+        <Text style={[type.eyebrow, { fontSize: 9, color: colors.accent }]}>
+          Reglare automată (PID)
+        </Text>
+        <Text style={styles.pidStatus}>
+          {isPid ? "Activă" : "Mod curbă"}
+        </Text>
+      </View>
+
+      {isPid ? (
+        <>
+          <View style={styles.pidValueRow}>
+            <TouchableOpacity
+              onPress={dec}
+              style={styles.pidStepBtn}
+              disabled={value <= TARGET_TEMP_MIN}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.pidStepBtnText}>−</Text>
+            </TouchableOpacity>
+            <View style={styles.pidValueWrap}>
+              <Text style={styles.pidValue}>{value}</Text>
+              <Text style={styles.pidUnit}>°C</Text>
+            </View>
+            <TouchableOpacity
+              onPress={inc}
+              style={styles.pidStepBtn}
+              disabled={value >= TARGET_TEMP_MAX}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.pidStepBtnText}>+</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.pidHint}>
+            Agentul reglează ventilatoarele pentru a menține CPU-ul la {value}°C.
+            Limite: {TARGET_TEMP_MIN}–{TARGET_TEMP_MAX}°C.
+          </Text>
+          <TouchableOpacity
+            onPress={disable}
+            style={styles.pidSecondaryBtn}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.pidSecondaryText}>Înapoi la curbă</Text>
+          </TouchableOpacity>
+        </>
+      ) : (
+        <>
+          <Text style={styles.pidHint}>
+            Profilul folosește curba clasică temperatură → viteză. Activează
+            reglarea automată ca să specifici o temperatură-țintă, iar agentul
+            să ajusteze ventilatoarele dinamic.
+          </Text>
+          <TouchableOpacity
+            onPress={enable}
+            style={styles.pidPrimaryBtn}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.pidPrimaryText}>Activează reglare automată</Text>
+          </TouchableOpacity>
+        </>
+      )}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg0 },
   content: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm },
@@ -271,6 +475,98 @@ const styles = StyleSheet.create({
     lineHeight: 38,
     letterSpacing: -1,
   },
+  // PID target temperature editor (sits below the active hero card).
+  pidCard: {
+    marginTop: spacing.md,
+    backgroundColor: colors.bg1,
+    borderRadius: radius.lg,
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.06)",
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.lg,
+    gap: spacing.md,
+  },
+  pidHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  pidStatus: {
+    fontFamily: "SpaceMono" as any,
+    fontSize: 11,
+    color: colors.text2,
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+  },
+  pidValueRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.lg,
+  },
+  pidStepBtn: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.bg2,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  pidStepBtnText: {
+    fontSize: 28,
+    color: colors.text0,
+    fontWeight: "300",
+    lineHeight: 30,
+  },
+  pidValueWrap: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 4,
+  },
+  pidValue: {
+    fontSize: 56,
+    fontWeight: "800",
+    color: colors.accent,
+    letterSpacing: -1.5,
+    lineHeight: 60,
+  },
+  pidUnit: {
+    fontSize: 18,
+    color: colors.text2,
+    fontWeight: "500",
+  },
+  pidHint: {
+    fontSize: 12,
+    color: colors.text2,
+    lineHeight: 18,
+  },
+  pidPrimaryBtn: {
+    backgroundColor: colors.accent,
+    paddingVertical: spacing.md,
+    borderRadius: radius.md,
+    alignItems: "center",
+  },
+  pidPrimaryText: {
+    color: "#0a0c10",
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+  pidSecondaryBtn: {
+    paddingVertical: spacing.sm + 2,
+    borderRadius: radius.md,
+    alignItems: "center",
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  pidSecondaryText: {
+    color: colors.text1,
+    fontSize: 13,
+    fontWeight: "500",
+  },
+
   // Active hero card — at top of screen
   activeHero: {
     marginTop: spacing.md,

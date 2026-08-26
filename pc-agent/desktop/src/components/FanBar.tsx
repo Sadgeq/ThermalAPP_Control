@@ -56,12 +56,14 @@ export default function FanBar({ name, percent, rpm }: Props) {
         fontFamily: "'JetBrains Mono', monospace",
         fontSize: 11,
         fontWeight: 500,
-        color: colors.text2,
-        width: 64,
+        // 0 RPM is meaningful (fan-stop / idle); show it instead of "—".
+        // Dimming the color makes it visually clear the fan is parked.
+        color: rpm > 0 ? colors.text2 : colors.text3,
+        width: 70,
         textAlign: "right",
         flexShrink: 0,
       }}>
-        {rpm > 0 ? `${rpm} rpm` : "—"}
+        {`${rpm.toLocaleString()} rpm`}
       </div>
 
       <div style={{

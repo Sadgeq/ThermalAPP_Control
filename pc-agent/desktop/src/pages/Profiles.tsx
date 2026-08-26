@@ -1,17 +1,9 @@
 import { useState, useEffect } from "react";
 import { useTheme } from "../lib/ThemeContext";
-import { fetchProfiles, activateProfile, ProfileData, FanMode, SensorData } from "../lib/api";
+import { fetchProfiles, activateProfile, ProfileData, SensorData } from "../lib/api";
 
-// On 82NL the BIOS exposes 3 thermal policies; map agent profile names to them.
-// Profiles still drive agent-side curves/thresholds, but the actual fan response
-// is governed by the BIOS mode set here.
-const PROFILE_TO_MODE: Record<string, FanMode> = {
-  Silent: 1,
-  Balanced: 2,
-  Gaming: 3,
-  Turbo: 3,
-};
-
+// Each profile carries its own BIOS fan_mode (1=Quiet, 2=Balanced, 3=Performance).
+// Profiles without a fan_mode don't change the BIOS policy when activated.
 const MODE_DESCRIPTIONS: Record<string, string> = {
   Silent: "Lowest fan speed caps. Fans ramp gently under load. Best for light tasks and battery life.",
   Balanced: "Default thermal profile. Good for everyday use and most workloads.",
@@ -166,7 +158,7 @@ export default function Profiles({ sensorData }: Props) {
             {profiles.map((p) => {
               const isActive = p.name === activeName;
               const isActivating = activating === p.name;
-              const mode = PROFILE_TO_MODE[p.name];
+              const mode = p.fan_mode;
               return (
                 <button
                   key={p.name}
@@ -271,13 +263,13 @@ export default function Profiles({ sensorData }: Props) {
               fontSize: 18, fontWeight: 600, color: colors.accent,
             }}>
               {activeName ?? "—"}
-              {activeName && PROFILE_TO_MODE[activeName] && (
+              {activeName && profileData?.profiles[activeName]?.fan_mode != null && (
                 <span style={{
                   marginLeft: 8, fontSize: 11, color: colors.text3,
                   fontFamily: "'JetBrains Mono', monospace",
                   fontWeight: 500,
                 }}>
-                  MODE {PROFILE_TO_MODE[activeName]}
+                  MODE {profileData.profiles[activeName].fan_mode}
                 </span>
               )}
             </div>

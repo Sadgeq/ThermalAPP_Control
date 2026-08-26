@@ -8,6 +8,8 @@
     "userInterfaceStyle": "dark",
     "scheme": "thermalcontrol",
     "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
       "backgroundColor": "#07090e"
     },
     "ios": {
@@ -15,10 +17,20 @@
       "bundleIdentifier": "com.thermalcontrol.mobile"
     },
     "android": {
+      "package": "com.thermalcontrol.mobile",
+      "versionCode": 1,
       "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png",
         "backgroundColor": "#07090e"
       },
-      "package": "com.thermalcontrol.mobile"
+      "permissions": [
+        "android.permission.INTERNET"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-router",

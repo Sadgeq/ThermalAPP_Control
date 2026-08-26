@@ -55,13 +55,17 @@ class CommandListener:
         self,
         url: str,
         anon_key: str,
-        access_token: str,
+        token_provider: Callable[[], Optional[str]],
         device_id: str,
         on_command: Callable[[dict], None],
     ):
+        # token_provider is called before every reconnect so we always
+        # subscribe with a fresh JWT. Static access tokens expire after ~1h
+        # and the realtime channel silently dies; this is what stopped
+        # mobile commands flowing after the agent had been up for an hour.
         self._url = url
         self._anon_key = anon_key
-        self._access_token = access_token
+        self._token_provider = token_provider
         self._device_id = device_id
         self._on_command = on_command
 
@@ -145,11 +149,19 @@ class CommandListener:
         # The `realtime` package is bundled with supabase-py.
         from realtime import AsyncRealtimeClient  # type: ignore
 
+        # Pull a fresh token for this connection. The provider may refresh
+        # the underlying Supabase session if the cached JWT is near expiry.
+        access_token = self._token_provider()
+        if not access_token:
+            # No usable session — bail and let the reconnect backoff retry
+            # later when (we hope) the agent has refreshed its credentials.
+            raise RuntimeError("No access token available from provider")
+
         socket_url = self._url.replace("https://", "wss://").rstrip("/") + "/realtime/v1"
         client = AsyncRealtimeClient(socket_url, self._anon_key)
         # Set the user's access token so RLS sees auth.uid() on the channel.
         try:
-            await client.set_auth(self._access_token)
+            await client.set_auth(access_token)
         except Exception:
             # Older realtime-py versions don't have set_auth; the JWT is
             # passed via query string when params include apikey + token.

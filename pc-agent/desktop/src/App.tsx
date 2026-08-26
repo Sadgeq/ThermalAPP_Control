@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ThemeProvider, useTheme } from "./lib/ThemeContext";
 import { AuthProvider, useAuth } from "./lib/AuthContext";
 import { useSensors } from "./hooks/useSensors";
 import TopNav from "./components/TopNav";
 import IconSidebar from "./components/IconSidebar";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Dashboard from "./pages/Dashboard";
 import Profiles from "./pages/Profiles";
 import Logs from "./pages/Logs";
@@ -18,6 +19,34 @@ function AppInner() {
   const { data, connected } = useSensors();
   const { colors } = useTheme();
   const { session, loading } = useAuth();
+
+  // Keyboard shortcuts. Ctrl+1..4 jumps to a tab; we deliberately don't
+  // intercept when the user is typing in an input/textarea (otherwise the
+  // ThresholdRow / profile-name inputs would lose number keys). Listening
+  // on window so it works regardless of focus.
+  useEffect(() => {
+    if (!session) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        return;
+      }
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const map: Record<string, Page> = {
+        "1": "dashboard",
+        "2": "profiles",
+        "3": "logs",
+        "4": "settings",
+      };
+      const target = map[e.key];
+      if (target) {
+        e.preventDefault();
+        setPage(target);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [session]);
 
   if (loading) {
     return (
@@ -67,7 +96,7 @@ function AppInner() {
     }}>
       <IconSidebar active={page} onNavigate={setPage} />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        <TopNav active={page} onNavigate={setPage} connected={connected} session={session} />
+        <TopNav active={page} onNavigate={setPage} connected={connected} session={session} sensorData={data} />
         <main style={{ flex: 1, overflow: "hidden" }}>
           {page === "dashboard" && <Dashboard data={data} connected={connected} />}
           {page === "profiles" && <Profiles sensorData={data} />}
@@ -81,10 +110,12 @@ function AppInner() {
 
 export default function App() {
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <AppInner />
-      </AuthProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <AuthProvider>
+          <AppInner />
+        </AuthProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

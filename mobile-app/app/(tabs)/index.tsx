@@ -4,9 +4,12 @@ import {
   Text,
   ScrollView,
   StyleSheet,
+  TouchableOpacity,
+  Alert,
   useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import * as Haptics from "expo-haptics";
 import Svg, { Path, Line, Rect, Defs, LinearGradient, Stop } from "react-native-svg";
 import { colors, radius, spacing, type, tempColor, loadColor } from "@/lib/theme";
 import { useDevices } from "@/hooks/useDevices";
@@ -322,6 +325,14 @@ export default function DashboardScreen() {
           </View>
         </View>
 
+        {/* === MANUAL FAN CONTROL === */}
+        {selectedId && (
+          <View style={styles.section}>
+            <Text style={[type.eyebrow, styles.sectionTitle]}>Reglare manuală</Text>
+            <ManualFanCard deviceId={selectedId} />
+          </View>
+        )}
+
         {/* === FANS === */}
         {data.fan_speeds.length > 0 && (
           <View style={styles.section}>
@@ -332,7 +343,7 @@ export default function DashboardScreen() {
                   key={i}
                   name={f.name || `Fan ${i + 1}`}
                   rpm={f.rpm ?? 0}
-                  percent={f.percent ?? 0}
+                  percent={typeof f.percent === "number" ? f.percent : null}
                 />
               ))}
             </View>
@@ -459,8 +470,94 @@ function PerfRow({
   );
 }
 
-function FanCard({ name, rpm, percent }: { name: string; rpm: number; percent: number }) {
-  const pct = Math.max(0, Math.min(100, percent));
+// Manual fan-speed control. Sends a `set_all_fans` command to the agent
+// via Supabase when the user taps Apply. The command flows through
+// realtime → agent → hardware in ~2s, then the agent's monitoring loop
+// will start applying the curve again on the NEXT active-profile cycle —
+// so manual control here is a one-shot push, not a sticky override.
+// (The agent's set_all_fans handler also calls profile_engine.set_active(None),
+// which means the user has manually overridden whichever profile was active.
+// Re-activating a profile from the Profiles tab brings it back.)
+function ManualFanCard({ deviceId }: { deviceId: string }) {
+  const [pct, setPct] = useState(50);
+  const [busy, setBusy] = useState(false);
+  const [lastSent, setLastSent] = useState<number | null>(null);
+
+  const dec = () => setPct((v) => Math.max(0, v - 5));
+  const inc = () => setPct((v) => Math.min(100, v + 5));
+
+  const apply = async () => {
+    if (busy) return;
+    setBusy(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    try {
+      const { error } = await supabase.from("commands").insert({
+        device_id: deviceId,
+        command_type: "set_all_fans",
+        payload: { speed_percent: pct },
+        status: "pending",
+      });
+      if (error) throw error;
+      setLastSent(pct);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (e: any) {
+      Alert.alert("Couldn't apply", e?.message ?? String(e));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View style={styles.manualFanCard}>
+      <View style={styles.manualFanRow}>
+        <TouchableOpacity
+          onPress={dec}
+          style={styles.manualFanStep}
+          disabled={pct <= 0}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.manualFanStepText}>−</Text>
+        </TouchableOpacity>
+        <View style={styles.manualFanValueWrap}>
+          <Text style={styles.manualFanValue}>{pct}</Text>
+          <Text style={styles.manualFanUnit}>%</Text>
+        </View>
+        <TouchableOpacity
+          onPress={inc}
+          style={styles.manualFanStep}
+          disabled={pct >= 100}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.manualFanStepText}>+</Text>
+        </TouchableOpacity>
+      </View>
+      <Text style={styles.manualFanHint}>
+        Setează viteza tuturor ventilatoarelor manual. Înlocuiește profilul
+        activ; reactivează un profil din tab-ul Profiles ca să revii la
+        controlul automat.
+      </Text>
+      <TouchableOpacity
+        onPress={apply}
+        style={[styles.manualFanApply, busy && { opacity: 0.6 }]}
+        disabled={busy}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.manualFanApplyText}>
+          {busy ? "Se aplică…" : lastSent === pct ? `Aplicat (${pct}%)` : `Apply ${pct}%`}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+function FanCard({ name, rpm, percent }: { name: string; rpm: number; percent: number | null }) {
+  // percent can be null when the agent doesn't have PWM controller readback
+  // for this fan (typical in the WMI-only path on Legion). Treat null as
+  // "unknown" rather than rendering 0% of max — that would lie when the
+  // fan is clearly spinning at 3000 RPM.
+  const hasPercent = percent !== null && Number.isFinite(percent);
+  const pct = hasPercent ? Math.max(0, Math.min(100, percent as number)) : 0;
   return (
     <View style={styles.fanCard}>
       <View style={styles.fanCardTop}>
@@ -476,7 +573,9 @@ function FanCard({ name, rpm, percent }: { name: string; rpm: number; percent: n
       <View style={styles.fanCardBarTrack}>
         <View style={[styles.fanCardBarFill, { width: `${pct}%` }]} />
       </View>
-      <Text style={styles.fanCardPct}>{Math.round(pct)}% of max</Text>
+      <Text style={styles.fanCardPct}>
+        {hasPercent ? `${Math.round(pct)}% of max` : "—"}
+      </Text>
     </View>
   );
 }
@@ -973,6 +1072,73 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   perfBarFill: { height: "100%", borderRadius: 3 },
+
+  // Manual fan-speed control card (sits above the fan grid).
+  manualFanCard: {
+    backgroundColor: colors.bg1,
+    borderRadius: radius.lg,
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.06)",
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.lg,
+    gap: spacing.md,
+  },
+  manualFanRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.lg,
+  },
+  manualFanStep: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.bg2,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  manualFanStepText: {
+    fontSize: 28,
+    color: colors.text0,
+    fontWeight: "300",
+    lineHeight: 30,
+  },
+  manualFanValueWrap: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 4,
+  },
+  manualFanValue: {
+    fontSize: 56,
+    fontWeight: "800",
+    color: colors.text0,
+    letterSpacing: -1.5,
+    lineHeight: 60,
+  },
+  manualFanUnit: {
+    fontSize: 18,
+    color: colors.text2,
+    fontWeight: "500",
+  },
+  manualFanHint: {
+    fontSize: 12,
+    color: colors.text2,
+    lineHeight: 18,
+  },
+  manualFanApply: {
+    backgroundColor: colors.accent,
+    paddingVertical: spacing.md,
+    borderRadius: radius.md,
+    alignItems: "center",
+  },
+  manualFanApplyText: {
+    color: "#0a0c10",
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
 
   // Fan grid (2-up)
   fanGrid: {

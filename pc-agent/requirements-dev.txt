@@ -1,0 +1,7 @@
+# Build-only dependencies. Install with:
+#   pip install -r requirements-dev.txt
+# Then run `pyinstaller agent.spec --clean` from this directory.
+
+-r requirements.txt
+
+pyinstaller>=6.0

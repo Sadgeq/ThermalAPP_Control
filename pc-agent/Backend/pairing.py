@@ -303,9 +303,9 @@ def prompt_for_code() -> str:
     """Read a pairing code from stdin with a friendly banner."""
     sys.stdout.write(
         "\n"
-        "============================================================\n"
-        "  ThermalControl — first run pairing\n"
-        "============================================================\n"
+        "------------------------------------------------------------\n"
+        "  Pair with mobile (PIN)\n"
+        "------------------------------------------------------------\n"
         "  1. Open the ThermalControl mobile app\n"
         "  2. Sign in (Google or email)\n"
         "  3. Tap  Settings  →  Add this PC\n"
@@ -318,6 +318,288 @@ def prompt_for_code() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Direct sign-in methods
+# ---------------------------------------------------------------------------
+# These cover the case where the user is running `python agent.py` directly
+# and doesn't want the mobile-app PIN dance. The Tauri sidecar handoff via
+# TAURI_ACCESS_TOKEN env still bypasses everything here in production builds.
+
+_OAUTH_PORT = 54321  # same fixed port the Tauri desktop OAuth handler uses
+_OAUTH_TIMEOUT_S = 120  # 2 minutes for the user to complete the browser flow
+
+_OAUTH_SUCCESS_HTML = b"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Signed in</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #07090e; color: #e6e7ea;
+    display: flex; align-items: center; justify-content: center;
+    height: 100vh; margin: 0; text-align: center; }
+  .card { padding: 32px 40px; border-radius: 12px; background: #10131a;
+    border: 0.5px solid #1f242c; }
+  h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+  p { margin: 0; font-size: 13px; color: #9ba1a8; }
+</style></head><body><div class="card">
+<h1>Signed in to ThermalControl</h1>
+<p>You can close this tab and return to the agent.</p>
+</div></body></html>"""
+
+
+def prompt_signin_method() -> str:
+    """Show the first-run sign-in menu and return the chosen method.
+
+    Returns one of "google" / "email" / "pin". Loops on invalid input.
+    """
+    sys.stdout.write(
+        "\n"
+        "============================================================\n"
+        "  ThermalControl — first-run sign-in\n"
+        "============================================================\n"
+        "  How do you want to sign in?\n"
+        "\n"
+        "    1) Sign in with Google           (opens browser)\n"
+        "    2) Sign in with email/password\n"
+        "    3) Pair with mobile (PIN code)\n"
+        "\n"
+        "  (Tip: subsequent runs resume automatically from your OS\n"
+        "   keyring — you only see this menu the first time.)\n"
+        "============================================================\n"
+    )
+    sys.stdout.flush()
+    while True:
+        choice = input("  Choice [1/2/3]: ").strip().lower()
+        if choice in ("1", "google", "g"):
+            return "google"
+        if choice in ("2", "email", "e"):
+            return "email"
+        if choice in ("3", "pin", "mobile", "p"):
+            return "pin"
+        sys.stdout.write("  Invalid choice. Please enter 1, 2, or 3.\n")
+
+
+def sign_in_with_email(
+    cloud_client,
+    hardware_id: str,
+    name: str,
+    os_info: str,
+    controller: str = "",
+) -> StoredDevice:
+    """Sign in with Supabase email/password from a TTY prompt.
+
+    Uses getpass so the password isn't echoed. After auth succeeds, registers
+    the device under the signed-in user and returns a StoredDevice the caller
+    persists to the keyring.
+    """
+    import getpass
+
+    sys.stdout.write(
+        "\n"
+        "------------------------------------------------------------\n"
+        "  Sign in with email/password\n"
+        "------------------------------------------------------------\n"
+    )
+    sys.stdout.flush()
+
+    email = input("  Email: ").strip()
+    password = getpass.getpass("  Password: ")
+
+    cloud_client.sign_in(email, password)
+    # Best-effort: clear the local password reference so it doesn't linger
+    # in the function frame longer than needed.
+    password = ""
+
+    device_id = cloud_client.register_device(
+        hardware_id=hardware_id,
+        name=name,
+        os_info=os_info,
+        controller=controller,
+    )
+    user_id, refresh_token = _extract_session_tokens(cloud_client)
+    return StoredDevice(
+        device_id=device_id,
+        user_id=user_id or "",
+        refresh_token=refresh_token or "",
+        access_token="",
+    )
+
+
+def sign_in_with_google(
+    cloud_client,
+    hardware_id: str,
+    name: str,
+    os_info: str,
+    controller: str = "",
+) -> StoredDevice:
+    """Sign in via Google OAuth using the same PKCE-loopback pattern the
+    Tauri desktop app uses.
+
+    Steps:
+      1. Ask Supabase for the OAuth authorize URL with a localhost redirect.
+         supabase-py stashes the PKCE code_verifier in client storage during
+         this call.
+      2. Spin up a one-shot HTTP server on localhost:54321 to catch the
+         redirect.
+      3. Open the browser to the authorize URL.
+      4. When the user finishes signing in, the redirect hits our server
+         carrying ?code=… in the query string.
+      5. Exchange that code for a session via exchange_code_for_session.
+         supabase-py reads the code_verifier from storage automatically.
+      6. Register the device, return a StoredDevice for keyring persistence.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import urllib.parse as urlp
+    import webbrowser
+
+    redirect_to = f"http://localhost:{_OAUTH_PORT}"
+
+    sys.stdout.write(
+        "\n"
+        "------------------------------------------------------------\n"
+        "  Sign in with Google\n"
+        "------------------------------------------------------------\n"
+    )
+    sys.stdout.flush()
+
+    # Step 1 — get the authorize URL. supabase-py stores PKCE state.
+    try:
+        resp = cloud_client.client.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": redirect_to,
+                "skip_browser_redirect": True,
+            },
+        })
+    except Exception as e:
+        raise RuntimeError(f"Could not start Google sign-in: {e}")
+    auth_url = getattr(resp, "url", None)
+    if not auth_url:
+        raise RuntimeError("Supabase didn't return an authorize URL")
+
+    # Step 2 — local server to catch the callback. We use a closure flag
+    # rather than threading because handle_request() is blocking and we
+    # want this to be deliberately one-shot.
+    captured: dict = {"code": None, "error": None}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlp.urlparse(self.path)
+            params = urlp.parse_qs(parsed.query)
+            captured["code"] = (params.get("code") or [None])[0]
+            captured["error"] = (
+                params.get("error_description")
+                or params.get("error")
+                or [None]
+            )[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(_OAUTH_SUCCESS_HTML)
+
+        # Silence the default per-request stdout logs.
+        def log_message(self, format, *args):
+            return
+
+    try:
+        server = HTTPServer(("localhost", _OAUTH_PORT), _Handler)
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not bind localhost:{_OAUTH_PORT} for OAuth redirect "
+            f"(another agent or desktop app may already be using it): {e}"
+        )
+
+    server.timeout = _OAUTH_TIMEOUT_S
+
+    # Step 3 — open the browser. Falls back to printing the URL.
+    print(f"\n  Opening browser to sign in...")
+    print(f"  If your browser didn't open, visit this URL manually:\n    {auth_url}\n")
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    # Step 4 — wait for the redirect. handle_request() blocks up to timeout.
+    deadline = time.monotonic() + _OAUTH_TIMEOUT_S
+    try:
+        while captured["code"] is None and captured["error"] is None:
+            if time.monotonic() > deadline:
+                raise RuntimeError("OAuth sign-in timed out (waited 2 minutes)")
+            server.handle_request()
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    if captured["error"]:
+        raise RuntimeError(f"OAuth error: {captured['error']}")
+    code = captured["code"]
+    if not code:
+        raise RuntimeError("OAuth callback didn't include an authorization code")
+
+    # Step 5 — exchange the code for a session. PKCE verifier comes from
+    # the client's internal storage (set by sign_in_with_oauth above).
+    try:
+        cloud_client.client.auth.exchange_code_for_session({"auth_code": code})
+    except Exception as e:
+        raise RuntimeError(f"exchange_code_for_session failed: {e}")
+
+    # Pull user info from the now-active session.
+    try:
+        user = cloud_client.client.auth.get_user()
+        cloud_client.user_id = user.user.id
+        cloud_client._healthy = True
+    except Exception:
+        # Fall back to whatever the session contains.
+        sess = cloud_client.client.auth.get_session()
+        if sess and getattr(sess, "user", None):
+            cloud_client.user_id = sess.user.id
+            cloud_client._healthy = True
+    if not cloud_client.user_id:
+        raise RuntimeError("Sign-in succeeded but couldn't read user_id")
+
+    # Step 6 — register the device and build the StoredDevice.
+    device_id = cloud_client.register_device(
+        hardware_id=hardware_id,
+        name=name,
+        os_info=os_info,
+        controller=controller,
+    )
+    user_id, refresh_token = _extract_session_tokens(cloud_client)
+    return StoredDevice(
+        device_id=device_id,
+        user_id=user_id or cloud_client.user_id or "",
+        refresh_token=refresh_token or "",
+        access_token="",
+    )
+
+
+def _extract_session_tokens(cloud_client) -> tuple[Optional[str], Optional[str]]:
+    """Pull (user_id, refresh_token) from the cloud client's current session.
+
+    Used by both sign-in paths to build a StoredDevice. Returns (None, None)
+    if the session can't be read for any reason — the caller decides whether
+    that's fatal.
+    """
+    try:
+        sess = cloud_client.client.auth.get_session()
+        if sess is None:
+            return (None, None)
+        # supabase-py wraps differently in different versions; handle both.
+        s = getattr(sess, "session", None) or sess
+        user_id = None
+        u = getattr(s, "user", None)
+        if u is not None:
+            user_id = getattr(u, "id", None)
+        refresh_token = getattr(s, "refresh_token", None)
+        return (user_id, refresh_token)
+    except Exception:
+        return (None, None)
+
+
+# Module-level constant used in pairing's __init__-style globals. Defined
+# here so it's only created once.
+import time  # noqa: E402  (kept here so the helpers above can use time.monotonic)
+
+
+# ---------------------------------------------------------------------------
 # High-level orchestration
 # ---------------------------------------------------------------------------
 def authenticate_or_pair(
@@ -327,12 +609,13 @@ def authenticate_or_pair(
     device_name: str,
     os_info: str,
     interactive: bool = True,
+    controller: str = "",
 ) -> StoredDevice:
     """Establish a Supabase session for the agent.
 
     Order of attempts:
       1. Stored refresh token in keyring → refresh_session.
-      2. Interactive PIN pairing → claim_pairing RPC.
+      2. Interactive sign-in menu → Google OAuth / email / PIN-pair.
     Saves the resulting credential to the keyring on success.
 
     Raises RuntimeError if no path works.
@@ -347,12 +630,12 @@ def authenticate_or_pair(
             logger.info(f"Resumed session for device {fresh.device_id[:8]}…")
             return fresh
         except Exception as e:
-            logger.warning(f"Stored credential rejected, re-pairing: {e}")
+            logger.warning(f"Stored credential rejected, re-signing in: {e}")
             clear_stored(supabase_url)
 
-    # 2. Interactive pairing.
+    # 2. Interactive sign-in menu.
     if not interactive:
-        raise RuntimeError("No stored credentials and pairing wizard disabled")
+        raise RuntimeError("No stored credentials and interactive sign-in disabled")
 
     if not sys.stdin.isatty():
         raise RuntimeError(
@@ -363,20 +646,40 @@ def authenticate_or_pair(
 
     last_err: Optional[Exception] = None
     for attempt in range(3):
-        code = prompt_for_code()
+        method = prompt_signin_method()
         try:
-            sd = claim_with_code(
-                cloud_client,
-                code=code,
-                hardware_id=hardware_id,
-                name=device_name,
-                os_info=os_info,
-            )
+            if method == "google":
+                sd = sign_in_with_google(
+                    cloud_client,
+                    hardware_id=hardware_id,
+                    name=device_name,
+                    os_info=os_info,
+                    controller=controller,
+                )
+            elif method == "email":
+                sd = sign_in_with_email(
+                    cloud_client,
+                    hardware_id=hardware_id,
+                    name=device_name,
+                    os_info=os_info,
+                    controller=controller,
+                )
+            else:  # "pin"
+                code = prompt_for_code()
+                sd = claim_with_code(
+                    cloud_client,
+                    code=code,
+                    hardware_id=hardware_id,
+                    name=device_name,
+                    os_info=os_info,
+                )
             save_stored(supabase_url, sd)
-            print(f"\n  Paired. Welcome to ThermalControl.\n")
+            print(f"\n  Signed in. Welcome to ThermalControl.\n")
             return sd
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             last_err = e
-            print(f"\n  ✗ Pairing failed: {e}\n")
+            print(f"\n  ✗ Sign-in failed: {e}\n")
 
-    raise RuntimeError(f"Pairing exhausted retries: {last_err}")
+    raise RuntimeError(f"Sign-in exhausted retries: {last_err}")

@@ -1,11 +1,15 @@
+import { useEffect, useState } from "react";
 import { useTheme } from "../lib/ThemeContext";
 import type { Page } from "../App";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { SensorData } from "../lib/api";
+
 type Props = {
   active: Page;
   onNavigate: (page: Page) => void;
   connected: boolean;
   session: any;
+  sensorData?: SensorData;
 };
 
 const TABS: { id: Page; label: string }[] = [
@@ -14,7 +18,7 @@ const TABS: { id: Page; label: string }[] = [
   { id: "logs", label: "Logs" },
 ];
 
-export default function TopNav({ active, onNavigate, connected, session }: Props) {
+export default function TopNav({ active, onNavigate, connected, session, sensorData }: Props) {
   const { colors, theme, toggle } = useTheme();
 
   const email = session?.user?.email || "";
@@ -25,6 +29,35 @@ export default function TopNav({ active, onNavigate, connected, session }: Props
   const handleMinimize = () => appWindow.minimize();
   const handleMaximize = () => appWindow.toggleMaximize();
   const handleClose = () => appWindow.close();
+
+  // Always-on-top toggle. Useful when monitoring temps over a fullscreen
+  // game — the window stays visible without alt-tab. Persists locally so a
+  // user who pinned the window keeps the preference across launches.
+  const [pinned, setPinned] = useState<boolean>(() => {
+    try { return localStorage.getItem("tc-always-on-top") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    appWindow.setAlwaysOnTop(pinned).catch(() => {});
+    try { localStorage.setItem("tc-always-on-top", pinned ? "1" : "0"); } catch {}
+  }, [pinned]);
+
+  // Color the temp readouts so a glance tells you the thermal state. Tracks
+  // the warn/crit thresholds the user picks in Settings; we don't have those
+  // here, so use defensible defaults — 75°C warn, 90°C crit.
+  const tempColor = (t: number | null | undefined) => {
+    if (t == null) return colors.text3;
+    if (t >= 90) return colors.danger;
+    if (t >= 75) return colors.warn;
+    return colors.text1;
+  };
+  const cpu = sensorData?.cpu_temp ?? null;
+  const gpu = sensorData?.gpu_temp ?? null;
+  // Average RPM across all detected fans. 0 is shown as "0 rpm"
+  // (fan-stop is meaningful), null only when there are no fans at all.
+  const fans = sensorData?.fan_speeds ?? [];
+  const avgRpm = fans.length > 0
+    ? Math.round(fans.reduce((s, f) => s + (f.rpm || 0), 0) / fans.length)
+    : null;
 
   return (
     <div
@@ -110,6 +143,39 @@ export default function TopNav({ active, onNavigate, connected, session }: Props
         gap: 6,
         height: "100%",
       }}>
+        {/* Live thermals — always visible, regardless of which tab the
+            user is on. Color-coded by temperature for quick scan. */}
+        {connected && (
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            marginRight: 6,
+          }}>
+            <span style={{ color: colors.text3, letterSpacing: 0.5 }}>CPU</span>
+            <span style={{ color: tempColor(cpu), fontWeight: 500 }}>
+              {cpu != null ? `${Math.round(cpu)}°` : "—"}
+            </span>
+            <span style={{ color: colors.text3, letterSpacing: 0.5, marginLeft: 4 }}>GPU</span>
+            <span style={{ color: tempColor(gpu), fontWeight: 500 }}>
+              {gpu != null ? `${Math.round(gpu)}°` : "—"}
+            </span>
+            {avgRpm != null && (
+              <>
+                <span style={{ color: colors.text3, letterSpacing: 0.5, marginLeft: 4 }}>FAN</span>
+                <span style={{
+                  color: avgRpm > 0 ? colors.text1 : colors.text3,
+                  fontWeight: 500,
+                }}>
+                  {avgRpm > 0 ? `${avgRpm.toLocaleString()}` : "0"}
+                </span>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Connection status */}
         <div style={{
           display: "flex",
@@ -127,6 +193,20 @@ export default function TopNav({ active, onNavigate, connected, session }: Props
           }} />
           {connected ? "Online" : "Offline"}
         </div>
+
+        {/* Always-on-top toggle */}
+        <button
+          onClick={() => setPinned((p) => !p)}
+          title={pinned ? "Unpin window" : "Pin window on top"}
+          style={iconBtnStyle(colors, pinned)}
+        >
+          {/* Pushpin icon */}
+          <svg width="13" height="13" viewBox="0 0 24 24" fill={pinned ? "currentColor" : "none"}
+               stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 2v6l-4 4v3h8v-3l-4-4V2z" />
+            <line x1="12" y1="15" x2="12" y2="22" />
+          </svg>
+        </button>
 
         {/* Theme toggle */}
         <button
